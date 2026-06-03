@@ -1,0 +1,57 @@
+diff --git a/pjrt_implementation/src/api/module_builder/module_builder.cc b/pjrt_implementation/src/api/module_builder/module_builder.cc
+index 0ae7b16fd..56c7fe906 100644
+--- a/pjrt_implementation/src/api/module_builder/module_builder.cc
++++ b/pjrt_implementation/src/api/module_builder/module_builder.cc
+@@ -58,6 +58,7 @@
+ #include "ttmlir/Dialect/TTCore/IR/TTCoreOpsTypes.h"
+ #include "ttmlir/Dialect/TTIR/Pipelines/TTIRPipelines.h"
+ #include "ttmlir/Dialect/TTIR/Transforms/Passes.h"
++#include "ttmlir/Dialect/TTNN/IR/TTNNOps.h"
+ #include "ttmlir/Dialect/TTNN/Pipelines/TTNNPipelines.h"
+ #include "ttmlir/Dialect/TTNN/Transforms/Passes.h"
+ #include "ttmlir/RegisterAll.h"
+@@ -1112,6 +1113,44 @@ tt_pjrt_status ModuleBuilder::convertFromTTIRToTTNN(
+     return tt_pjrt_status::kInternal;
+   }
+ 
++  // [Precision fix] Ensure every op that carries a device compute kernel config
++  // (matmul, linear, softmax, sum/mean/max/min reductions, conv, ...) runs at
++  // fp32 accumulation precision. Two gaps in the default lowering cause the bulk
++  // of Qwen TT parity error:
++  //   1. matmul/linear get math_fidelity=HiFi4 + fp32_dest_acc_en=true from the
++  //      ttnn-set-compute-kernel-config pass, but packer_l1_acc is left false
++  //      (the pass default; the TTNN pipeline does not expose it). Partial
++  //      results packed to the same L1 address across K-blocks then accumulate
++  //      in low precision, so fp32 matmul error grows with the contraction dim
++  //      K (observed: K=64 -> ~0.04, K=8192 -> ~10.5 abs error vs CPU).
++  //   2. softmax and the generic reductions are lowered with a null
++  //      compute_config, so at runtime they fall back to TTNN's default
++  //      (LoFi + fp32_dest_acc_en=false -> bf16 dest accumulation). An f32
++  //      attention softmax / log-softmax then executes at bf16, which is the
++  //      dominant residual on top of the matmul error.
++  // Fix: fill missing math_fidelity (-> HiFi4) and fp32_dest_acc_en (-> true)
++  // without overriding explicit settings, and always enable packer_l1_acc.
++  mlir_module->walk([](mlir::Operation *op) {
++    auto ckOp =
++        mlir::dyn_cast<mlir::tt::ttnn::TTNNComputeKernelConfigOpInterface>(op);
++    if (!ckOp) {
++      return;
++    }
++    mlir::tt::ttnn::DeviceComputeKernelConfigAttr cfg =
++        ckOp.getComputeConfigAttr();
++    if (!cfg) {
++      cfg = mlir::tt::ttnn::DeviceComputeKernelConfigAttr::get(op->getContext());
++    }
++    if (!cfg.getMathFidelity().has_value()) {
++      cfg = cfg.withMathFidelity(mlir::tt::ttnn::MathFidelity::HiFi4);
++    }
++    if (!cfg.getFp32DestAccEn()) {
++      cfg = cfg.withFp32DestAccEn(true);
++    }
++    cfg = cfg.withPackerL1Acc(true);
++    ckOp.setComputeConfigAttr(cfg);
++  });
++
+   ttnn_mlir = getMlirCode(mlir_module);
+ 
+   printModule(mlir_module, compile_options.export_path, "ttnn",
