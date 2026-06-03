@@ -118,12 +118,28 @@ if (fp32_dest_acc_en && (is_all_fp32_formats(buf_dataformat_arr) || exp_prec==B)
 With fp32 operands + `fp32_dest_acc_en=true` (the opt0 default, ensured by the
 patch), the override fires and `SrcA`/`SrcB` are unpacked as **TF32 (~10 mantissa
 bits)** — the Blackhole matrix engine's *maximum* fp32 input precision (only the
-SFPU does true fp32). HW confirms: a single matmul product (K=1) lands at 9.8
-mantissa bits = TF32, not bf16. `Float16_b` is only the non-`fp32_dest_acc`
-fallback branch — not what runs here — and the `"TF32 unsupported atm"` throw at
-`tile.cpp:93` is L1 tile-storage size bookkeeping, not the unpack-to-SrcReg path
-(which uses TF32 fine). So there is no software bug in the matmul precision path:
-tt-metal already feeds the FPU its highest-precision fp32 input.
+SFPU does true fp32). `Float16_b` is only the non-`fp32_dest_acc` fallback branch
+— not what runs here — and the `"TF32 unsupported atm"` throw at `tile.cpp:93` is
+L1 tile-storage size bookkeeping, not the unpack-to-SrcReg path (which uses TF32
+fine). TF32 is the documented matrix-engine maximum
+(tt-metal `docs/source/tt-metalium/tt_metal/advanced_topics/compute_engines_and_dataflow_within_tensix.rst:168`:
+"the matrix engine's maximum accuracy is TF32 ... less than full 32-bit
+precision"). So there is no software bug in the matmul precision path: tt-metal
+already feeds the FPU its highest-precision fp32 input.
+
+Measuring the effective mantissa bits of the matmul inputs directly
+(`repro_matmul_bits.py`, small K to isolate input rounding from accumulation)
+confirms TF32, not bf16 (which would be ~7-8 bits):
+
+```text
+   K   rel_err(median)  eff_bits   (bf16~7-8, tf32~10, fp32~23)
+   1     1.005e-03         9.96
+   2     1.051e-03         9.89
+   4     1.025e-03         9.93
+   8     1.121e-03         9.80
+  16     1.130e-03         9.79
+  64     1.323e-03         9.56
+```
 
 Isolation tests confirm storage and the vector path are clean; only the matrix
 engine drops precision:
@@ -147,13 +163,21 @@ matmul K=1 (single product, no accum):     relmedian 1.16e-3  ~= 9.8 mantissa bi
 
 ## Minimal Reproducer
 
-Two standalone JAX scripts, no model harness:
+Four standalone JAX scripts, no model harness:
 
 - [supplemental/repro_tt_matmul_precision.py](/home/houjun/lessons/2026-06-03-tt-matmul-fp32-accumulation-precision/supplemental/repro_tt_matmul_precision.py)
   — plain fp32 `einsum` matmuls CPU vs TT, sweeping K ∈ {64,256,1024,4096,8192},
   then re-running K=4864 under explicit `compiler_options` (opt level,
   `math_fidelity`, `fp32_dest_acc_en`). Error grows with K and is unchanged by
   hifi4+fp32acc (== opt0 default).
+- [supplemental/repro_matmul_bits.py](/home/houjun/lessons/2026-06-03-tt-matmul-fp32-accumulation-precision/supplemental/repro_matmul_bits.py)
+  — measures the effective mantissa bits of matmul inputs vs a float64 reference
+  across small K. Distinguishes the TF32 input ceiling (~10 bits) from bf16
+  (~7-8 bits); produces the table in Root Cause §2.
+- [supplemental/dump_matmul_ir.py](/home/houjun/lessons/2026-06-03-tt-matmul-fp32-accumulation-precision/supplemental/dump_matmul_ir.py)
+  — compiles a plain f32 matmul with `TTXLA_LOGGER_LEVEL=DEBUG` and dumps the TTNN
+  IR; grep `ttnn.matmul` to read operand/output DataFormat + compute_config (fp32
+  operands + `fp32_dest_acc_en`, the condition that selects the TF32 unpack path).
 - [supplemental/repro_bf16_split_matmul.py](/home/houjun/lessons/2026-06-03-tt-matmul-fp32-accumulation-precision/supplemental/repro_bf16_split_matmul.py)
   — validates a 3× mantissa-split emulation. Splits each operand `x = hi + lo`
   (hi = bf16(x)), issues 3 matmuls `hi@hi + hi@lo + lo@hi`, and sums on the

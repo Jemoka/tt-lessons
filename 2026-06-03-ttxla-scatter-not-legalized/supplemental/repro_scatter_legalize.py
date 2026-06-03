@@ -51,10 +51,20 @@ def f_slice(x):
     return rotated.sum()
 
 
-def try_grad(name, fn):
-    g_cpu = np.asarray(jax.jit(jax.grad(fn), device=cpu)(jax.device_put(jnp.asarray(x), cpu)))
+# embedding gradient (the unavoidable scatter): gather rows by index (embedding
+# lookup); VJP scatter-adds gradients back into the rows of W.
+W = np.random.default_rng(1).standard_normal((16, 8)).astype(np.float32)
+
+
+def f_embed(W):
+    idx = jnp.asarray(np.array([0, 3, 1, 3, 2, 0, 1, 2], dtype=np.int32))
+    return jnp.take(W, idx, axis=0).sum()
+
+
+def try_grad(name, fn, inp):
+    g_cpu = np.asarray(jax.jit(jax.grad(fn), device=cpu)(jax.device_put(jnp.asarray(inp), cpu)))
     try:
-        g_tt = np.asarray(jax.jit(jax.grad(fn), device=tt)(jax.device_put(jnp.asarray(x), tt)))
+        g_tt = np.asarray(jax.jit(jax.grad(fn), device=tt)(jax.device_put(jnp.asarray(inp), tt)))
         diff = float(np.max(np.abs(g_cpu - g_tt)))
         print(f"[{name:16s}] TT grad OK   max|cpu-tt|={diff:.3e}", flush=True)
     except Exception as e:
@@ -63,5 +73,6 @@ def try_grad(name, fn):
 
 
 if __name__ == "__main__":
-    try_grad("gather (take)", f_gather)   # expect: failed to legalize stablehlo.scatter
-    try_grad("slice/concat", f_slice)     # expect: OK
+    try_grad("gather (take)", f_gather, x)   # expect: failed to legalize stablehlo.scatter
+    try_grad("slice/concat", f_slice, x)     # expect: OK
+    try_grad("embed grad", f_embed, W)       # expect: failed (the unavoidable scatter)

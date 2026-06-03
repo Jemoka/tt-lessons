@@ -96,8 +96,10 @@ training by themselves.
 ## Minimal Reproducer
 
 [supplemental/repro_scatter_legalize.py](/home/houjun/lessons/2026-06-03-ttxla-scatter-not-legalized/supplemental/repro_scatter_legalize.py)
-— standalone JAX. Takes the gradient of (a) a gather-based `rotate_half` and (b) a
-slice-based one, on CPU vs TT.
+— standalone JAX. Takes the gradient on CPU vs TT of (a) a gather-based
+`rotate_half`, (b) a slice-based `rotate_half`, and (c) an embedding lookup
+`take(W, idx)` — the unavoidable case (3). (a) and (c) abort the TT compile; (b)
+compiles and is bit-exact.
 
 ## Reproduction Steps
 
@@ -114,10 +116,11 @@ TT_VISIBLE_DEVICES=0 CONVERT_SHLO_TO_SHARDY=1 JAX_PLATFORMS=tt,cpu ARCH_NAME=bla
 ```text
 [gather (take)   ] TT grad FAILED: INTERNAL: Error code: 13   (failed to legalize stablehlo.scatter)
 [slice/concat    ] TT grad OK   max|cpu-tt|=0.000e+00
+[embed grad      ] TT grad FAILED: INTERNAL: Error code: 13   (failed to legalize stablehlo.scatter)
 ```
 
-The gather gradient aborts the TT compile; the slice/concat gradient compiles and
-is bit-exact vs CPU.
+The gather and embedding-gradient cases abort the TT compile; the slice/concat
+gradient compiles and is bit-exact vs CPU.
 
 ## Notes
 
