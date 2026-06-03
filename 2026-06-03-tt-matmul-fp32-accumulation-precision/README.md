@@ -147,7 +147,19 @@ hf loss: 7.848437309   jax loss: 7.848448809
 ```
 
 On TT, error appears only through the matmul path and scales with K as shown
-above. (End-to-end TT qwen_parity numbers on tt-qb2 to be appended.)
+above. End-to-end `qwen_parity.py` run **unmodified** on tt-qb2 (TT backend,
+default slow-safe chunking on):
+
+```text
+max diff: 0.6286   mean diff: 0.1059   top5 overlap: 5
+roundtrip hf->jax->hf max diff: 0.0
+hf loss: 7.848437   jax loss: 7.925876
+```
+
+The script runs to completion on Tenstorrent and the top-5 token set matches HF
+(5/5); the residual max-diff (0.63) is the un-eliminated tail of the matmul
+accumulation error. Closing it fully requires the tt-metal kernel fix (or a
+compiler-level large-K decomposition), not a model or tt-xla-compiler change.
 
 ## Notes
 
