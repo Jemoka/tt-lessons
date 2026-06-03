@@ -27,6 +27,11 @@ the embedding op's bf16 operand workaround, not a storage bug.
 - Distinct from: the matmul bf16-input precision issue, which is an FPU
   unpack/SrcReg matter, not storage — see
   [2026-06-03-tt-matmul-fp32-accumulation-precision](/home/houjun/lessons/2026-06-03-tt-matmul-fp32-accumulation-precision/README.md).
+- Related (same embedding op, backward side): the embedding *gradient* tile-padding
+  leak in
+  [2026-06-03-ttxla-embedding-bw-tile-padding-grad](/home/houjun/lessons/2026-06-03-ttxla-embedding-bw-tile-padding-grad/README.md).
+  This lesson is the forward bf16 cast; that one is the backward grad leak — same
+  op, different failure, not a duplicate.
 
 ## Repositories
 

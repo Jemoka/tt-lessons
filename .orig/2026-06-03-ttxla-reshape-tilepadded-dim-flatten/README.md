@@ -12,10 +12,10 @@ tensor's **physical** volume is 8× its logical volume; flattening to an unpadde
 layout makes the physical volumes disagree and tt-metal aborts.
 
 The reshape is emitted by the **gradient of the RoPE `rotate_half` gather**
-(`jnp.take(x, idx, axis=-1)` over a constant index permutation) inside the
-attention jvp of the training loss. It is a tt-mlir reshape-lowering bug: it emits
-a direct `ttnn.reshape` between a tile-padded layout and an unpadded one without
-routing through row-major / `to_layout` (which would drop the padding).
+(`theseus/model/layers/rope.py:45`, `jnp.take(x, idx, axis=-1)`) inside the
+attention jvp of the trainer's `train_eval.loss`. It is a tt-mlir reshape-lowering
+bug: it emits a direct `ttnn.reshape` between a tile-padded layout and an unpadded
+one without routing through row-major / `to_layout` (which would drop the padding).
 
 ## Status
 
@@ -23,34 +23,30 @@ routing through row-major / `to_layout` (which would drop the padding).
   tile padding when flattening a non-32-aligned dim; runtime FATAL.
 - Component: tt-mlir TTIR→TTNN reshape lowering (the `ttnn.reshape` between
   `#ttnn_layout129` and `#ttnn_layout130` below); surfaced via the RoPE gather VJP.
-- Fixed locally: **No.** Pinned (op + layouts + source).
+- Fixed locally: **No.** Pinned (op + layouts + source); fix owned by the rebuild
+  owner (primary).
 - Trigger: a reshape that flattens a tile-padded dim whose size is not a multiple
   of 32 (here `n_head = 4`). A model with `n_head % 32 == 0` would avoid it.
 - Scope: training (the gather-grad path). Inference is unaffected (no such reshape
-  in the forward graph; inference parity intact). This is the **third** distinct
-  gap in the TT training bring-up, after the scatter legalization fix
-  ([2026-06-03-ttxla-scatter-not-legalized](/home/houjun/lessons/2026-06-03-ttxla-scatter-not-legalized/README.md))
-  and the Shardy guard
-  ([2026-06-03-ttxla-shardy-reshard-collectives-assert](/home/houjun/lessons/2026-06-03-ttxla-shardy-reshard-collectives-assert/README.md)).
-- Related (same tile-padding family):
-  [2026-06-03-ttxla-embedding-bw-tile-padding-grad](/home/houjun/lessons/2026-06-03-ttxla-embedding-bw-tile-padding-grad/README.md)
-  — a different op (`ttnn.embedding_bw`), same root mechanism (a non-32-aligned dim
-  padded to a tile leaking/mismatching in a backward op).
+  in the forward graph; qwen_parity intact). This is the **third** distinct gap in
+  the TT training bring-up, after the scatter legalization fix and the Shardy guard.
 
 ## Repositories
 
 - `tt-xla` — `/home/houjun/tt-xla`, branch `main`, `03f29ed01` (dirty; scatter-fix
-  + Shardy-guard patches applied).
+  + Shardy-guard plugin live on tt-qb2).
+- `theseus` — `/home/houjun/theseus`, `feat/tenstorrent`, `f085ca6`.
 
 ## Host Environment
 
-4× Blackhole p150b, jax/jaxlib 0.7.1, ARCH_NAME=blackhole. Run pinned to chip 1
-(`TT_VISIBLE_DEVICES=1`), patched plugin. Model: GPT n_embd 256, **n_head 4**
-(→ head_dim 64), 2 layers, block_size 128, RoPE, vocab 100288; batch 8, seq 128.
+`tt-qb-ac-02` (tt-qb2), 4× Blackhole p150b, jax/jaxlib 0.7.1, ARCH_NAME=blackhole.
+Run pinned to chip 1 (`TT_VISIBLE_DEVICES=1`), patched plugin. Model: GPT
+n_embd 256, **n_head 4** (→ head_dim 64), 2 layers, block_size 128, RoPE, vocab
+100288, synthetic data; batch 8, seq 128.
 
 ## User-Visible Failure
 
-A GPT training step on TT aborts in the first train step:
+`theseus run gpt/train/pretrain` on TT aborts in the first train step:
 
 ```text
 TT_FATAL @ .../reshape_view/reshape_common.cpp:50: new_volume == old_volume
@@ -67,12 +63,13 @@ The failing op, from the train_step TTNN IR dump (`TTXLA_LOGGER_LEVEL=DEBUG`):
 ```text
 %137 = "ttnn.reshape"(%136) <{shape = [64, 4096]}>
        : (tensor<64x8x128x4xbf16, #ttnn_layout129>) -> tensor<64x4096xbf16, #ttnn_layout130>
-  loc("jit(train_step)/jvp(GPT)/GPT.decode/blocks_0/attn/attn.preprocess_qkv/jit(_take)")
+  loc("jit(train_step)/jvp(GPT)/GPT.decode/blocks_0/attn/attn.preprocess_qkv/jit(_take)"
+        <- BaseTrainer.train_step…train_eval…loss)
 ```
 
-Source: RoPE `rotate_half` —
-`rotated = jnp.take(x, rotate_half_indices, axis=-1)` (constant indices). The
-reshape is in the gradient (jvp) of that gather.
+Source: `theseus/model/layers/rope.py:45` —
+`rotated = jnp.take(x, self._rotate_half_indices, axis=-1)` (RoPE `rotate_half`,
+constant indices). The reshape is in the gradient (jvp) of that gather.
 
 The two layouts (the proof):
 
@@ -102,35 +99,36 @@ last-two-dims position. Verify a fix with the trainer reproducer below.
 
 ## Minimal Reproducer
 
-This bug is **layout/context-dependent**: it does not reduce to a bare gather-grad
-(see Notes), it needs the attention preprocessing transpose that puts the
-size-`n_head` dim in the tiled position. The reproducer is therefore a minimal
-standalone attention block, not a bare gather.
+This bug is **layout/context-dependent** and does not reduce to a bare gather-grad
+(see Notes); the reliable reproducer is the trainer:
 
-- [supplemental/repro_attn_rope_grad.py](/home/houjun/lessons/2026-06-03-ttxla-reshape-tilepadded-dim-flatten/supplemental/repro_attn_rope_grad.py)
-  — standalone JAX, no model harness. Builds a tiny GPT causal-attention block at
-  the triggering shapes (n_embd 256, **n_head 4**, head_dim 64, seq 128, batch 8),
-  applies RoPE `rotate_half` via `jnp.take(axis=-1)`, and takes the loss grad on
-  CPU vs TT. Runs an `n_head=32` control (tile-aligned) alongside. Expected on the
-  patched plugin: `n_head=4` → reshape FATAL, `n_head=32` → grad runs. (HW
-  verification pending; the model+grad are validated on CPU.)
-- [supplemental/repro_rope_reshape_NEGATIVE.py](/home/houjun/lessons/2026-06-03-ttxla-reshape-tilepadded-dim-flatten/supplemental/repro_rope_reshape_NEGATIVE.py)
-  — a bare gather-grad on `(8,128,4,64)` that does **not** reproduce (tt-mlir
-  chooses an unpadded layout). Kept to document the layout-dependence — it is why
-  the reproducer needs the attention context.
+1. Stage data + config on a TT box (chip 1), then run:
+
+```bash
+cd /home/houjun/theseus && source .venv/bin/activate
+mkdir -p /tmp/reshape_pin_out2/data/synthetic
+python -c "import numpy as np; r=np.random.default_rng(0); \
+  r.integers(0,100288,size=4_000_000,dtype=np.uint32).tofile('/tmp/reshape_pin_out2/data/synthetic/train.bin'); \
+  r.integers(0,100288,size=500_000,dtype=np.uint32).tofile('/tmp/reshape_pin_out2/data/synthetic/val.bin')"
+TT_VISIBLE_DEVICES=1 CONVERT_SHLO_TO_SHARDY=1 JAX_PLATFORMS=tt,cpu ARCH_NAME=blackhole \
+  theseus run reshape-pin \
+  /home/houjun/lessons/2026-06-03-ttxla-reshape-tilepadded-dim-flatten/supplemental/reshape_pin_cfg.yaml \
+  /tmp/reshape_pin_out2
+```
+
+Expected: the `new_volume == old_volume` reshape FATAL during the first train step.
+Add `TTXLA_LOGGER_LEVEL=DEBUG` to dump the TTNN IR and confirm the `#ttnn_layout129`
+padded memref on the `64x8x128x4 -> 64x4096` reshape.
+
+`supplemental/repro_rope_reshape_NEGATIVE.py` is a pure-JAX gather-grad on
+`(8,128,4,64)` that does **not** reproduce (tt-mlir chooses an unpadded layout) —
+kept to document the layout-dependence, not as a positive repro.
 
 ## Reproduction Steps
 
-From a venv that has the TT PJRT plugin installed:
-
-```bash
-source .venv/bin/activate
-TT_VISIBLE_DEVICES=1 CONVERT_SHLO_TO_SHARDY=1 JAX_PLATFORMS=tt,cpu ARCH_NAME=blackhole \
-  python /home/houjun/lessons/2026-06-03-ttxla-reshape-tilepadded-dim-flatten/supplemental/repro_attn_rope_grad.py
-```
-
-Add `TTXLA_LOGGER_LEVEL=DEBUG` to dump the TTNN IR and confirm the `#ttnn_layout129`
-padded memref on the `64x8x128x4 -> 64x4096` reshape.
+See Minimal Reproducer. The config (`reshape_pin_cfg.yaml`) is the resolved
+`gpt/train/pretrain` synthetic config (n_head 4, per_device_batch_size 8 so it runs
+without the dispatch harness).
 
 ## Verification
 
@@ -138,19 +136,18 @@ padded memref on the `64x8x128x4 -> 64x4096` reshape.
 Failing op : ttnn.reshape 64x8x128x4xbf16 (#ttnn_layout129, padded) -> 64x4096 (#ttnn_layout130)
 Layouts    : input memref<2048x1 x tile<32x32>> (size-4 dim padded to 32) ; output unpadded
 Phys vols  : 2,097,152 (in) vs 262,144 (target) -> new_volume != old_volume -> FATAL
-Source     : RoPE rotate_half gather (jnp.take axis=-1), in the training-loss jvp
+Source     : theseus/model/layers/rope.py:45 (rotate_half gather), in train_eval.loss jvp
 ```
 
 ## Notes
 
-- The bare pure-JAX gather-grad on `(8,128,4,64)`
-  (`repro_rope_reshape_NEGATIVE.py`) runs fine on TT (≈1.5e-2 bf16 error, no FATAL)
-  for both `n_head=4` and `n_head=32`, because tt-mlir lowers it with an unpadded
-  layout. The bug only appears with the attention/jvp context that produces the
-  transposed `64x8x128x4` tile-padded layout — hence the attention-block reproducer.
+- The minimal pure-JAX gather-grad on `(8,128,4,64)` ran fine on TT (≈1.5e-2 bf16
+  error, no FATAL) for both `n_head=4` and `n_head=32`, because tt-mlir lowered it
+  with an unpadded layout (scatter kept the head_dim in the tiled position). The bug
+  only appears with the attention/jvp context that produces the transposed
+  `64x8x128x4` tile-padded layout — hence the trainer-level reproducer.
 - `n_head=4` is the trigger here; the invariant is "flatten a tile-padded
   (not %32) dim". Qwen2.5-0.5B (n_head 14, head_dim 64) would hit the same class if
   trained with this RoPE-grad path — 14 is also not %32.
 - This is the gradient path enabled by the scatter-legalization fix
-  ([2026-06-03-ttxla-scatter-not-legalized](/home/houjun/lessons/2026-06-03-ttxla-scatter-not-legalized/README.md));
-  the reshape gap is the next layer down.
+  ([2026-06-03-ttxla-scatter-not-legalized]); the reshape gap is the next layer down.

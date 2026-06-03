@@ -47,6 +47,11 @@ the reshard at all for single-device runs.
 - Impact: on-device *training numerics* work (see the scatter lesson — RoPE scatter
   is bit-exact, a GPT trains via plain `jit`). What is blocked is any trainer that
   applies a tensor-parallel sharding plan unconditionally (including `n_shards=1`).
+- Related (on-device training bring-up sequence): the **second** of three gaps —
+  after the scatter legalization fix
+  ([2026-06-03-ttxla-scatter-not-legalized](/home/houjun/lessons/2026-06-03-ttxla-scatter-not-legalized/README.md)),
+  and before the `ttnn.reshape` tile-padding FATAL the guarded trainer then hits
+  ([2026-06-03-ttxla-reshape-tilepadded-dim-flatten](/home/houjun/lessons/2026-06-03-ttxla-reshape-tilepadded-dim-flatten/README.md)).
 - Scope of trigger: a non-trivial reshard on a size-1 named mesh axis. A *trivial*
   single-axis reshard (`P("x",None) → P(None,"x")` on `<"x"=1>`) is optimized away
   and does **not** abort; the matmul-driven transpose reshard on a 2-axis

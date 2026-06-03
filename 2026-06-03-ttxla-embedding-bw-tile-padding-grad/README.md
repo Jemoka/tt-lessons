@@ -38,6 +38,12 @@ indices are dynamic. It remains a genuine correctness bug for the constant-index
 - Trigger: non-32-aligned vocab/dim **AND** compile-time-constant indices. Dynamic-index
   backward is correct at any shape, so normal training (dynamic `input_ids`) is
   unaffected even on non-aligned models. Qwen2.5-0.5B is additionally tile-aligned.
+- Related (same tile-padding family, different op): the `ttnn.reshape` tile-padding
+  FATAL in
+  [2026-06-03-ttxla-reshape-tilepadded-dim-flatten](/home/houjun/lessons/2026-06-03-ttxla-reshape-tilepadded-dim-flatten/README.md)
+  — a non-32-aligned dim padded to a tile, mishandled in a backward op. Same root
+  mechanism, distinct op (`embedding_bw` scatter here vs `ttnn.reshape` there); not
+  a duplicate.
 
 ## Repositories
 

@@ -41,6 +41,11 @@ and a full GPT (with RoPE) **trains end-to-end on the device**.
   leak (not this fix), documented in
   [2026-06-03-ttxla-embedding-bw-tile-padding-grad](/home/houjun/lessons/2026-06-03-ttxla-embedding-bw-tile-padding-grad/README.md).
   The `ttnn.scatter` runtime handled `dim > 0` as-is; no runtime change was needed.
+- Related (on-device training bring-up sequence): this scatter fix is the **first**
+  of three gaps that block training. Next, the Shardy reshard assert
+  ([2026-06-03-ttxla-shardy-reshard-collectives-assert](/home/houjun/lessons/2026-06-03-ttxla-shardy-reshard-collectives-assert/README.md)),
+  then the `ttnn.reshape` tile-padding FATAL on the RoPE gather grad this fix
+  enables ([2026-06-03-ttxla-reshape-tilepadded-dim-flatten](/home/houjun/lessons/2026-06-03-ttxla-reshape-tilepadded-dim-flatten/README.md)).
 
 ## Repositories
 
