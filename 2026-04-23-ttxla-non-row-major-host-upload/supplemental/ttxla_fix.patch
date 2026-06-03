@@ -1,0 +1,169 @@
+diff --git a/pjrt_implementation/inc/api/buffer_instance.h b/pjrt_implementation/inc/api/buffer_instance.h
+index bdce0ff1a..676a31693 100644
+--- a/pjrt_implementation/inc/api/buffer_instance.h
++++ b/pjrt_implementation/inc/api/buffer_instance.h
+@@ -184,7 +184,8 @@ private:
+ 
+   // Calculates required tensor strides.
+   static std::vector<std::uint32_t>
+-  calculateStrides(size_t num_dims, const std::int64_t *byte_strides,
++  calculateStrides(const std::vector<std::uint32_t> &shape,
++                   size_t num_dims, const std::int64_t *byte_strides,
+                    size_t num_byte_strides, std::uint32_t element_size);
+ 
+   // Gets next UID for buffer instances, used in buffer instance constructor
+diff --git a/pjrt_implementation/src/api/buffer_instance.cc b/pjrt_implementation/src/api/buffer_instance.cc
+index bd0c9d579..2dd8768cb 100644
+--- a/pjrt_implementation/src/api/buffer_instance.cc
++++ b/pjrt_implementation/src/api/buffer_instance.cc
+@@ -11,6 +11,7 @@
+ #include "api/buffer_instance.h"
+ 
+ // c++ standard library includes
++#include <cstring>
+ #include <memory>
+ #include <numeric>
+ #include <optional>
+@@ -43,6 +44,55 @@
+ 
+ namespace tt::pjrt {
+ 
++namespace {
++
++std::vector<std::uint32_t>
++calculateDenseRowMajorStrides(const std::vector<std::uint32_t> &shape) {
++  std::vector<std::uint32_t> strides(shape.size(), 1);
++  std::uint64_t running_stride = 1;
++  for (std::size_t i = shape.size(); i-- > 0;) {
++    strides[i] = static_cast<std::uint32_t>(running_stride);
++    running_stride *= shape[i];
++  }
++  return strides;
++}
++
++std::vector<std::byte>
++materializeDenseRowMajorBuffer(const void *host_buffer,
++                               const std::vector<std::uint32_t> &shape,
++                               const std::vector<std::uint32_t> &src_strides,
++                               std::uint32_t element_size) {
++  std::uint64_t num_elements = std::accumulate(
++      shape.begin(), shape.end(), std::uint64_t{1}, std::multiplies<>());
++  std::vector<std::byte> dense_buffer(num_elements * element_size);
++
++  if (host_buffer == nullptr || num_elements == 0) {
++    return dense_buffer;
++  }
++
++  const std::vector<std::uint32_t> dense_strides =
++      calculateDenseRowMajorStrides(shape);
++  const std::byte *src = static_cast<const std::byte *>(host_buffer);
++
++  for (std::uint64_t linear_index = 0; linear_index < num_elements;
++       ++linear_index) {
++    std::uint64_t remainder = linear_index;
++    std::uint64_t src_linear_index = 0;
++    for (std::size_t dim = 0; dim < shape.size(); ++dim) {
++      const std::uint64_t coord = remainder / dense_strides[dim];
++      remainder %= dense_strides[dim];
++      src_linear_index += coord * src_strides[dim];
++    }
++
++    std::memcpy(dense_buffer.data() + linear_index * element_size,
++                src + src_linear_index * element_size, element_size);
++  }
++
++  return dense_buffer;
++}
++
++} // namespace
++
+ std::mutex BufferInstance::s_copy_to_host_internal_mutex;
+ 
+ std::unique_ptr<BufferInstance> BufferInstance::createInputBufferInstance(
+@@ -192,7 +242,20 @@ void BufferInstance::copyFromHost(
+   std::vector<std::uint32_t> shape =
+       calculateShape(dims, num_dims, m_data_type);
+   std::vector<std::uint32_t> strides =
+-      calculateStrides(num_dims, byte_strides, num_byte_strides, element_size);
++      calculateStrides(shape, num_dims, byte_strides, num_byte_strides,
++                       element_size);
++  const std::vector<std::uint32_t> dense_row_major_strides =
++      calculateDenseRowMajorStrides(shape);
++  const bool needs_row_major_compaction = strides != dense_row_major_strides;
++
++  std::vector<std::byte> compacted_host_buffer;
++  const void *host_buffer_to_use = host_buffer;
++  if (needs_row_major_compaction) {
++    compacted_host_buffer = materializeDenseRowMajorBuffer(
++        host_buffer, shape, strides, element_size);
++    host_buffer_to_use = compacted_host_buffer.data();
++    strides = dense_row_major_strides;
++  }
+ 
+   std::unique_ptr<EventInstance> done_with_host_buffer_event =
+       EventInstance::createInstance();
+@@ -215,12 +278,13 @@ void BufferInstance::copyFromHost(
+   // the buffer cannot be borrowed.
+   if (::tt::runtime::getCurrentHostRuntime() ==
+           tt::runtime::HostRuntime::Distributed ||
++      needs_row_major_compaction ||
+       host_buffer_semantics ==
+           PJRT_HostBufferSemantics_kImmutableOnlyDuringCall ||
+       !::tt::runtime::utils::isSupportedDataType(runtime_data_type)) {
+ 
+     runtime_tensor = tt::runtime::createOwnedHostTensor(
+-        host_buffer, shape, strides, element_size, runtime_data_type);
++        host_buffer_to_use, shape, strides, element_size, runtime_data_type);
+ 
+     // Memory is copied, we don't need host buffer anymore.
+     EventInstance::markAsReadyAndCallback(done_with_host_buffer_event.get(),
+@@ -236,7 +300,7 @@ void BufferInstance::copyFromHost(
+     // so we have to const cast here.
+     // https://github.com/tenstorrent/tt-metal/issues/20622
+     runtime_tensor = tt::runtime::createBorrowedHostTensor(
+-        const_cast<void *>(host_buffer), shape, strides, element_size,
++        const_cast<void *>(host_buffer_to_use), shape, strides, element_size,
+         runtime_data_type);
+ 
+     // Memory is aliased, we need to hold on to host buffer until this buffer is
+@@ -272,7 +336,7 @@ void BufferInstance::copyFromBuffer(BufferInstance *src_buffer) {
+       src_buffer->getDimensionsRaw(), src_buffer->getNumberOfDimensions(),
+       src_buffer->getDataType());
+   std::vector<std::uint32_t> strides = calculateStrides(
+-      src_buffer->getNumberOfDimensions(), nullptr, 0, element_size);
++      shape, src_buffer->getNumberOfDimensions(), nullptr, 0, element_size);
+ 
+   tt::runtime::Tensor runtime_tensor = tt::runtime::createOwnedHostTensor(
+       /* data= */ nullptr, shape, strides, element_size, runtime_data_type);
+@@ -308,7 +372,8 @@ BufferInstance::calculateShape(const std::int64_t *dims, size_t num_dims,
+ }
+ 
+ std::vector<std::uint32_t> BufferInstance::calculateStrides(
+-    size_t num_dims, const std::int64_t *byte_strides, size_t num_byte_strides,
++    const std::vector<std::uint32_t> &shape, size_t num_dims,
++    const std::int64_t *byte_strides, size_t num_byte_strides,
+     std::uint32_t element_size) {
+ 
+   TT_FATAL(num_byte_strides == 0 || num_byte_strides == num_dims,
+@@ -317,14 +382,13 @@ std::vector<std::uint32_t> BufferInstance::calculateStrides(
+            num_byte_strides, num_dims);
+ 
+   std::vector<std::uint32_t> strides;
+-  for (size_t i = 0; i < num_dims; ++i) {
+-    // If no strides are given the array is assumed to have a dense layout with
+-    // dimensions in major-to-minor order.
+-    std::uint32_t stride =
+-        num_byte_strides == 0
+-            ? 1
+-            : (byte_strides[i] / static_cast<std::int64_t>(element_size));
+-    strides.push_back(stride);
++  if (num_byte_strides == 0) {
++    strides = calculateDenseRowMajorStrides(shape);
++  } else {
++    for (size_t i = 0; i < num_dims; ++i) {
++      strides.push_back(
++          byte_strides[i] / static_cast<std::int64_t>(element_size));
++    }
+   }
+ 
+   return strides;
