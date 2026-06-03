@@ -21,8 +21,7 @@ Precise finding (the important nuance — verified op-by-op on hardware):
   with `index_vector_dim == 1`). These abort the compile:
   `error: failed to legalize operation 'stablehlo.scatter'`.
 - Integer-label cross-entropy (`optax.softmax_cross_entropy_with_integer_labels`)
-  also gathers; use a one-hot + `log_softmax` loss (scatter-free, what the theseus
-  model does) to avoid it.
+  also gathers; use a one-hot + `log_softmax` loss (scatter-free) to avoid it.
 
 So embedding gradients train on TT, but any model that gathers on a non-0 axis in
 the forward (e.g. RoPE via `jnp.take`) cannot be trained on-device until the
@@ -87,7 +86,7 @@ single-dimensional scatter it requires `index_vector_dim == 1` and
 on the GPT pretraining path:
 
 1. `optax.softmax_cross_entropy_with_integer_labels` — gathers the target-class
-   logit; VJP scatters. Avoid via one-hot + `log_softmax` (the theseus model loss).
+   logit; VJP scatters. Avoid via a one-hot + `log_softmax` loss.
 2. `RoPE.rotate_half` (`rope.py:45`) — `jnp.take(x, perm, axis=-1)`; VJP scatters
    on the **last** axis → `scatter_dims_to_operand_dims[0] != 0` → rejected by
    `checkBasicLegality` → **fails to legalize**. (A slice/concat `rotate_half` is

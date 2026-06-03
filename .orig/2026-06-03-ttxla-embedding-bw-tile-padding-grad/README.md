@@ -42,15 +42,17 @@ indices are dynamic. It remains a genuine correctness bug for the constant-index
 ## Repositories
 
 - `tt-xla` — `/home/houjun/tt-xla`, branch `main`,
-  `03f29ed01a2bca27f5d8eaace659534016c7d0c4` (dirty; patched plugin).
+  `03f29ed01a2bca27f5d8eaace659534016c7d0c4` (dirty; patched plugin on tt-qb2).
 - `tt-mlir` (submodule) — `/home/houjun/tt-xla/third_party/tt-mlir/src/tt-mlir`,
   `412daacc440f10bb98ccc685c311b01f1fadab70`.
+- `theseus` — `/home/houjun/theseus`, `feat/tenstorrent`,
+  `f085ca67fa68ef08d63668cd7f866b2b8147839e` (repros are theseus-free).
 
 ## Host Environment
 
-4× Blackhole p150b, jax/jaxlib 0.7.1, ARCH_NAME=blackhole. Probe pinned to chip 1
-(`TT_VISIBLE_DEVICES=1`), patched plugin. Startup `TT_FATAL ... remote mmio` lines
-are benign single-chip warnings.
+`tt-qb-ac-02` (tt-qb2.stanford.edu), 4× Blackhole p150b, jax/jaxlib 0.7.1,
+ARCH_NAME=blackhole. Probe pinned to chip 1 (`TT_VISIBLE_DEVICES=1`), patched
+plugin. Startup `TT_FATAL ... remote mmio` lines are benign single-chip warnings.
 
 ## User-Visible Failure
 
@@ -138,25 +140,18 @@ gradient back), or avoid the on-device embedding-backward for non-aligned shapes
 - [supplemental/repro_embed_grad_dimsweep.py](/home/houjun/lessons/2026-06-03-ttxla-embedding-bw-tile-padding-grad/supplemental/repro_embed_grad_dimsweep.py)
   — sweeps dim ∈ {1,2,4,8,16,32}, printing per-column mean(tt−cpu) to expose the
   odd-column / tile pattern.
-- [supplemental/repro_embed_grad_trigger.py](/home/houjun/lessons/2026-06-03-ttxla-embedding-bw-tile-padding-grad/supplemental/repro_embed_grad_trigger.py)
-  — at the non-aligned V16/D4 shape, crosses {constant, dynamic} index source ×
-  {`W[idx]`, `jnp.take`} indexing form. Isolates the trigger: constant-index
-  variants leak, dynamic-index variants are clean.
 
 Expected: correct (max 0) at tile-aligned vocab/dim (e.g. 32, 64); spurious +1.0 in
-odd columns of even rows for non-aligned shapes with a constant index; clean for a
-dynamic index at any shape.
+odd columns of even rows otherwise.
 
 ## Reproduction Steps
 
-From a venv that has the TT PJRT plugin installed:
-
 ```bash
+cd /home/houjun/theseus
 source .venv/bin/activate
 export TT_VISIBLE_DEVICES=1 CONVERT_SHLO_TO_SHARDY=1 JAX_PLATFORMS=tt,cpu ARCH_NAME=blackhole
 python /home/houjun/lessons/2026-06-03-ttxla-embedding-bw-tile-padding-grad/supplemental/repro_embed_grad_dupidx.py
 python /home/houjun/lessons/2026-06-03-ttxla-embedding-bw-tile-padding-grad/supplemental/repro_embed_grad_dimsweep.py
-python /home/houjun/lessons/2026-06-03-ttxla-embedding-bw-tile-padding-grad/supplemental/repro_embed_grad_trigger.py
 ```
 
 ## Verification
@@ -180,10 +175,12 @@ The tile-aligned cases are exact; the non-aligned cases corrupt deterministicall
 - The spurious value equals the cotangent, so a non-`sum` loss would leak that loss's
   cotangent values into the same odd-column/even-row positions — the magnitude
   varies but the structure (tile padding) is the invariant.
-- Cross-validated: an independent `max|cpu-tt|=1.0` came from a W=(16,8)
+- Cross-validated: the primary's independent `max|cpu-tt|=1.0` came from a W=(16,8)
   (non-aligned) repro — the same leak. A separate duplicate-accumulation audit (7
   configs, all tile-aligned, including Qwen-ish and GPT vocab/embd) found `embedding_bw`
   accumulates exactly (0.0), ruling out overwrite/last-wins. The two findings agree:
   accumulation is correct; only the non-aligned padded-tile region leaks.
-- The compile-time-constant-index trigger condition comes from the const-vs-dynamic
-  isolation in `repro_embed_grad_trigger.py` (variants A–D at V16/D4).
+- The compile-time-constant-index trigger condition comes from a follow-up isolation
+  (third helper, `/home/houjun/.agents/repro_embed_grad_trigger.py`, const vs dynamic
+  index at V16/D4). Incorporated here; not independently re-run on chip 1 (tt-qb2
+  install/lib was held during a plugin swap) — can confirm post-swap if needed.
