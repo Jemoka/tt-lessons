@@ -32,15 +32,14 @@ the reshard at all for single-device runs.
   `~/.cache/ttmlir-toolchain/src/shardy`). Reached via the tt-xla pass pipeline
   (`mlir::PassManager::run` → reshard_to_collectives).
 - Fixed locally: **framework-side workaround landed** (the Shardy compiler itself
-  is unpatched). `theseus/training/base.py` gates the tensor-parallel sharding rules:
-  `BaseTrainer._mesh_sharding_rules(model, mesh)` rewrites every `"shard"` rule to
-  replicated when `mesh.shape[SHARD] == 1`, so no `sdy.ReshardOp` is emitted on a
-  single device. All 5 trainer `logical_to_mesh_sharding(rules=...)` sites (base ×2,
-  lora ×2, contrastive, kl_divergence) route through it. Inert when `SHARD > 1`;
-  CPU-validated (`gpt/train/pretrain` completes). This clears the Shardy crash; the
-  trainer then hits a separate `ttnn.reshape` runtime gap (see Notes). The pure-JAX
-  repro still aborts (it bypasses the framework guard) and documents the underlying
-  compiler bug, which a defense-in-depth upstream fix would close (see Fix).
+  is unpatched). The trainer gates its tensor-parallel sharding rules: when the
+  shard mesh axis has size 1, every `"shard"` rule is rewritten to replicated, so
+  no `sdy.ReshardOp` is emitted on a single device. All sharding-rule sites route
+  through that one guard; it is inert when the shard axis is >1, and CPU-validated.
+  This clears the Shardy crash; the trainer then hits a separate `ttnn.reshape`
+  runtime gap (a distinct issue, not this bug). The standalone repro still aborts
+  (it bypasses the framework guard) and documents the underlying compiler bug,
+  which a defense-in-depth upstream fix would close (see Fix).
 - Independent of the scatter fix
   ([2026-06-03-ttxla-scatter-not-legalized](/home/houjun/lessons/2026-06-03-ttxla-scatter-not-legalized/README.md)):
   this aborts before any scatter is reached, and reproduces with no gather/scatter
@@ -102,18 +101,17 @@ bookkeeping leaves the reshard "not done," tripping the assertion instead of
 emitting a no-op. Because it is a release `assert`/abort, the whole process dies
 with a core dump rather than a recoverable error.
 
-## Fix
+The compiler itself is unpatched; a framework-side workaround is in place. Two
+directions:
 
-Not fixed. Two directions:
-
-1. **Upstream (correct fix):** make `CollectiveInserter` treat a reshard whose
-   differing axes all have size 1 as a no-op (or complete its factor bookkeeping)
-   so `isDone()` holds. This is in bundled Shardy
+1. **Upstream (correct fix, not done):** make `CollectiveInserter` treat a reshard
+   whose differing axes all have size 1 as a no-op (or complete its factor
+   bookkeeping) so `isDone()` holds. This is in bundled Shardy
    (`reshard_to_collectives.cc`), so it needs a tt-mlir-toolchain rebuild.
-2. **Framework-side (workaround):** do not apply the tensor-parallel sharding plan
-   when there is a single shard/device (`n_shards == 1`) — emit the graph without
-   `"shard"`-axis annotations so no reshard is produced. This unblocks
-   single-device TT training without touching the compiler.
+2. **Framework-side (workaround, landed):** when there is a single shard/device
+   (shard axis size 1), rewrite the `"shard"` sharding rules to replicated so no
+   reshard is produced. This unblocks single-device TT training without touching
+   the compiler, and is inert when the shard axis is >1.
 
 The standalone numerics path (plain `jit`, no sharding plan) already trains on
 device and is the current way to exercise TT training end-to-end.
