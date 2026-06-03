@@ -102,31 +102,42 @@ last-two-dims position. Verify a fix with the trainer reproducer below.
 
 ## Minimal Reproducer
 
-This bug is **layout/context-dependent**: it does not reduce to a bare gather-grad
-(see Notes), it needs the attention preprocessing transpose that puts the
-size-`n_head` dim in the tiled position. The reproducer is therefore a minimal
-standalone attention block, not a bare gather.
+The bug is **layout/context-dependent and has resisted minimal reduction**. Three
+standalone JAX attempts all ran **clean on hardware** (no FATAL) — tt-mlir picks an
+*unpadded* layout for the reshape outside the exact trainer graph. **The only
+confirmed reproducer is the full trainer** (`gpt/train/pretrain`, below). The
+standalone scripts are kept only to document the layout-dependence; all are NEGATIVE
+(HW-verified non-reproducing):
 
-- [supplemental/repro_attn_rope_grad.py](/home/houjun/lessons/2026-06-03-ttxla-reshape-tilepadded-dim-flatten/supplemental/repro_attn_rope_grad.py)
-  — standalone JAX, no model harness. Builds a tiny GPT causal-attention block at
-  the triggering shapes (n_embd 256, **n_head 4**, head_dim 64, seq 128, batch 8),
-  applies RoPE `rotate_half` via `jnp.take(axis=-1)`, and takes the loss grad on
-  CPU vs TT. Runs an `n_head=32` control (tile-aligned) alongside. Expected on the
-  patched plugin: `n_head=4` → reshape FATAL, `n_head=32` → grad runs. (HW
-  verification pending; the model+grad are validated on CPU.)
-- [supplemental/repro_rope_reshape_NEGATIVE.py](/home/houjun/lessons/2026-06-03-ttxla-reshape-tilepadded-dim-flatten/supplemental/repro_rope_reshape_NEGATIVE.py)
-  — a bare gather-grad on `(8,128,4,64)` that does **not** reproduce (tt-mlir
-  chooses an unpadded layout). Kept to document the layout-dependence — it is why
-  the reproducer needs the attention context.
+- `supplemental/repro_rope_reshape_NEGATIVE.py` — bare gather-grad on `(8,128,4,64)`;
+  TT grad runs (≈1.5e-2 bf16), no FATAL, at n_head 4 and 32.
+- `supplemental/repro_attn_rope_grad.py` — standalone causal-attention block (qkv →
+  RoPE `rotate_half` take → attention → loss grad) at the triggering shapes (n_embd
+  256, n_head 4, head_dim 64, seq 128, batch 8), f32. **HW-verified: TT grad OK at
+  both n_head=4 and n_head=32 — does NOT reproduce** (its docstring's "expected
+  FATAL" predates HW verification and is wrong).
+- `supplemental/repro_attn_rope_grad_bf16_NEGATIVE.py` — the same block with bf16
+  activations (matching the trainer's `activation: bfloat16`). **Also OK — does NOT
+  reproduce.**
+
+The padded `#ttnn_layout129` only arises in the real trainer's `train_eval.loss`
+jvp, so the reproducer is the trainer command in Reproduction Steps.
 
 ## Reproduction Steps
 
-From a venv that has the TT PJRT plugin installed:
+From a venv that has the TT PJRT plugin installed (the trainer is the only confirmed
+reproducer; the standalone scripts are diagnostic negatives):
 
 ```bash
-source .venv/bin/activate
+cd /home/houjun/theseus && source .venv/bin/activate
+mkdir -p /tmp/reshape_pin_out2/data/synthetic
+python -c "import numpy as np; r=np.random.default_rng(0); \
+  r.integers(0,100288,size=4_000_000,dtype=np.uint32).tofile('/tmp/reshape_pin_out2/data/synthetic/train.bin'); \
+  r.integers(0,100288,size=500_000,dtype=np.uint32).tofile('/tmp/reshape_pin_out2/data/synthetic/val.bin')"
 TT_VISIBLE_DEVICES=1 CONVERT_SHLO_TO_SHARDY=1 JAX_PLATFORMS=tt,cpu ARCH_NAME=blackhole \
-  python /home/houjun/lessons/2026-06-03-ttxla-reshape-tilepadded-dim-flatten/supplemental/repro_attn_rope_grad.py
+  theseus run reshape-pin \
+  /home/houjun/lessons/2026-06-03-ttxla-reshape-tilepadded-dim-flatten/supplemental/reshape_pin_cfg.yaml \
+  /tmp/reshape_pin_out2
 ```
 
 Add `TTXLA_LOGGER_LEVEL=DEBUG` to dump the TTNN IR and confirm the `#ttnn_layout129`

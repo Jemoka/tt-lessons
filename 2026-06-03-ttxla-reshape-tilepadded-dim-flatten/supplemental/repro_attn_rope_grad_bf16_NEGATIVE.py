@@ -21,11 +21,8 @@ Run on a box with the TT PJRT plugin:
   TT_VISIBLE_DEVICES=1 CONVERT_SHLO_TO_SHARDY=1 JAX_PLATFORMS=tt,cpu \
       ARCH_NAME=blackhole python repro_attn_rope_grad.py
 
-HW RESULT (Blackhole, patched plugin, verified): this does NOT reproduce — TT grad
-runs OK for BOTH n_head=4 and n_head=32 (an f32 and a bf16-activation variant were
-both tried). tt-mlir picks an unpadded layout for this standalone block, so the
-padded #ttnn_layout129 that crashes never arises here. The bug only reproduces via
-the full trainer (gpt/train/pretrain); this file is kept as a diagnostic NEGATIVE.
+Expected (Blackhole, patched plugin): n_head=4 -> reshape FATAL during the TT grad;
+n_head=32 control -> grad runs. (Verify on hardware.)
 """
 
 import os
@@ -61,8 +58,8 @@ def loss_fn(params, idx, tgt, n_head, perm, signs):
     B, T = idx.shape
     C = params["wte"].shape[1]
     hd = C // n_head
-    x = params["wte"][idx] + params["wpe"][:T]              # (B,T,C)
-    qkv = x @ params["qkv"]                                 # (B,T,3C)
+    x = (params["wte"][idx] + params["wpe"][:T]).astype(jnp.bfloat16)   # bf16 activations (match trainer)
+    qkv = x @ params["qkv"].astype(jnp.bfloat16)                                 # (B,T,3C)
     qkv = qkv.reshape(B, T, 3, n_head, hd)
     q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]      # (B,T,nh,hd)
     # apply RoPE rotate_half to q,k (the gather whose VJP emits the reshape)
@@ -77,8 +74,8 @@ def loss_fn(params, idx, tgt, n_head, perm, signs):
     att = jax.nn.softmax(att, axis=-1)
     y = att @ v                                             # (B,nh,T,hd)
     y = y.transpose(0, 2, 1, 3).reshape(B, T, C)
-    y = y @ params["proj"]
-    logits = y @ params["head"]                             # (B,T,vocab)
+    y = y.astype(jnp.bfloat16) @ params["proj"].astype(jnp.bfloat16)
+    logits = (y.astype(jnp.bfloat16) @ params["head"].astype(jnp.bfloat16)).astype(jnp.float32)                             # (B,T,vocab)
     logp = jax.nn.log_softmax(logits, axis=-1)
     oh = jax.nn.one_hot(tgt, logits.shape[-1])
     return -(oh * logp).sum() / (B * T)
