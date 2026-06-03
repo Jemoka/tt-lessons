@@ -12,10 +12,16 @@ gradient is exact.
 
 Duplicate-index accumulation itself is correct (a token appearing N times in the
 batch gets N× its gradient). The bug is purely a tile-padding leak in the backward
-op; the forward gather is unaffected. Practical impact: silent training-gradient
-corruption for any model whose vocab or embedding dim is not 32-aligned. Qwen2.5-0.5B
-is *not* affected — its dims are tile-aligned (vocab 151936 = 32×4748, hidden 896 =
-32×28).
+op; the forward gather is unaffected.
+
+**Two necessary conditions** (the leak needs BOTH; established by a follow-up trigger
+isolation): (1) vocab or embed-dim is not a multiple of 32, AND (2) the gather index
+tensor is a **compile-time constant** (constant / constant-folded). With a dynamic
+(runtime-arg) index, the embedding-bw gradient is correct even at non-aligned shapes.
+Because real training feeds **dynamic `input_ids`**, the practical training blast
+radius is ≈ none — not just for Qwen2.5-0.5B (which is also tile-aligned: vocab
+151936 = 32×4748, hidden 896 = 32×28), but for non-aligned models too, as long as the
+indices are dynamic. It remains a genuine correctness bug for the constant-index path.
 
 ## Status
 
@@ -26,10 +32,12 @@ is *not* affected — its dims are tile-aligned (vocab 151936 = 32×4748, hidden
   handling of the padded tile region. Not a generic scatter; not an accumulation bug.
 - Fixed locally: **No.** This is a characterization; root cause is pinned to tile
   padding (vocab/dim % 32 != 0), fix not yet implemented.
-- Scope: affects training (backward) only; forward gather is correct (separate bf16
+- Scope: backward (gather-VJP) only; forward gather is correct (separate bf16
   embedding cast is documented in
   [2026-06-03-ttxla-fp32-embedding-bf16-cast](/home/houjun/lessons/2026-06-03-ttxla-fp32-embedding-bf16-cast/README.md)).
-- Does NOT affect Qwen2.5-0.5B (tile-aligned dims); does affect any non-aligned vocab/dim.
+- Trigger: non-32-aligned vocab/dim **AND** compile-time-constant indices. Dynamic-index
+  backward is correct at any shape, so normal training (dynamic `input_ids`) is
+  unaffected even on non-aligned models. Qwen2.5-0.5B is additionally tile-aligned.
 
 ## Repositories
 
@@ -103,6 +111,19 @@ JAX emits for the gather VJP is converted to `ttir.embedding_backward` →
 the defect is solely its handling of the padded tile region when vocab/dim are not
 multiples of 32, which leaks the cotangent into odd columns of even rows.
 
+The leak additionally requires the gather index tensor to be a **compile-time
+constant**. A trigger-isolation probe at the same non-aligned V16/D4 shows:
+
+```text
+constant index   -> LEAK  (max|cpu-tt| = 1.0)
+dynamic index    -> CLEAN (max|cpu-tt| = 0.0)
+```
+
+So a constant/constant-folded index drives the padded-tile read; a dynamic index
+(runtime arg, as in a normal jitted train step over `input_ids`) takes a correct
+path. The repros in this lesson use a closed-over constant `idx`, which is why they
+expose the leak; pass `idx` as a jit argument to see the clean path.
+
 ## Fix
 
 Not implemented. The fix belongs in the embedding-backward path (tt-mlir lowering or
@@ -159,3 +180,7 @@ The tile-aligned cases are exact; the non-aligned cases corrupt deterministicall
   configs, all tile-aligned, including Qwen-ish and GPT vocab/embd) found `embedding_bw`
   accumulates exactly (0.0), ruling out overwrite/last-wins. The two findings agree:
   accumulation is correct; only the non-aligned padded-tile region leaks.
+- The compile-time-constant-index trigger condition comes from a follow-up isolation
+  (third helper, `/home/houjun/.agents/repro_embed_grad_trigger.py`, const vs dynamic
+  index at V16/D4). Incorporated here; not independently re-run on chip 1 (tt-qb2
+  install/lib was held during a plugin swap) — can confirm post-swap if needed.
