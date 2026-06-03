@@ -1,7 +1,7 @@
 """Pure-JAX softmax / reduce precision probe: CPU vs Tenstorrent.
 
-Theseus-free reproducer for the suspected tt-xla softmax precision bug.
-Hypothesis (from tt-mlir lowering dive, talk.md ~12:10 PDT Jun 3): ttnn.softmax
+Standalone JAX reproducer for the tt-xla softmax/reduce precision bug.
+Hypothesis (from the tt-mlir lowering): ttnn.softmax
 and generic reduces are lowered with NO compute_config, so they execute at the
 TTNN default (LoFi math fidelity, fp32_dest_acc_en=false -> bf16 dest
 accumulation), unlike ttnn.rms_norm which is forced to HiFi4+fp32. An f32
@@ -12,8 +12,8 @@ vocab=151936 log_softmax used in the loss. Everything stays f32 on the host so
 any downcast is the backend's doing.
 
 Run (one chip; pin to a free one):
-  TT_VISIBLE_DEVICES=1 CONVERT_SHLO_TO_SHARDY=1 \
-    python /home/houjun/.agents/repro_softmax_precision.py
+  TT_VISIBLE_DEVICES=1 CONVERT_SHLO_TO_SHARDY=1 JAX_PLATFORMS=tt,cpu \
+    ARCH_NAME=blackhole python repro_softmax_reduce_precision.py
 """
 
 import os

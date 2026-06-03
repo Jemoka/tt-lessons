@@ -1,64 +1,59 @@
-# TT-XLA Lowers Softmax and Generic Reductions Without an fp32 Compute Config, So They Accumulate in bf16
+# TT-XLA Lowers Softmax and Generic Reductions Without an fp32 Compute Config
 
 ## Summary
 
 On Tenstorrent Blackhole, an f32 `jax.nn.softmax` diverges from CPU by ~3.9e-2
 (6.5% relative), and a bare f32 `reduce_sum` over 512 elements diverges by
-~3.7e-2, even though every input/output stays f32 in the IR. Elementwise ops
-(`exp`, `silu`, RoPE) are exact to f32 epsilon (~5e-7), and `rms_norm` is tight
+~3.7e-2, even though every input and output stays f32 in the IR. Elementwise ops
+(`exp`, `silu`, RoPE) are exact to f32 epsilon (~5e-7) and `rms_norm` is tight
 (~1.6e-4). The split — reductions bad, elementwise exact, RMSNorm fine — points
-at the reduction accumulator running in bf16.
+at the reduction running in low precision.
 
-There are two facts here. The IR fact: the TTIR→TTNN conversion patterns for
-`softmax` and the generic reductions (`sum`/`max`/`min`) attach **no
-`compute_config`**, so they fall back to TTNN's default `WormholeComputeKernelConfig`
-(LoFi, `fp32_dest_acc_en=false` → bf16 accumulation), while `ttnn.rms_norm` alone
-force-sets HiFi4 + `fp32_dest_acc_en`. The empirical fact (learned after the fix
-shipped): attaching that same high-precision config does **not** reduce the
-reduce/softmax error at all — because the operands are already bf16 in DRAM
-(stored bf16 on host→device upload), so fp32 *accumulation* can't recover mantissa
-the *input* already lost. The real lever is keeping operands fp32 in DRAM / fed to
-the FPU — a tt-metal property below tt-xla. See Verification for the null result.
+The IR-level cause is concrete: the TTIR→TTNN conversion patterns for `softmax`
+and the generic reductions (`sum`/`max`/`min`) attach **no `compute_config`**, so
+they fall back to TTNN's default `WormholeComputeKernelConfig` (LoFi,
+`fp32_dest_acc_en=false` → bf16 accumulation), whereas `ttnn.rms_norm` alone
+force-sets HiFi4 + `fp32_dest_acc_en`. That asymmetry is a real lowering omission.
+A caveat learned after the fact (see Verification): attaching the same
+high-precision config does **not** reduce the reduce/softmax error, because these
+ops are input-bound — their operands are already bf16 by the time the reduction
+runs, so promoting the accumulator cannot recover lost mantissa. The omission is
+worth fixing for correctness, but it is not the lever that closes this gap.
 
 ## Status
 
 - Bug type: numeric precision (silent bf16 accumulation in f32 graphs).
 - Component: `tt-mlir` TTIR→TTNN conversion (softmax + reduction patterns).
-- Fixed locally: **Attempted, ineffective.** The HiFi4+fp32_dest_acc+packer_l1_acc
-  compute-config patch was built and deployed (by the primary agent) but left the
-  reduce/softmax op error byte-identical (see Verification). The dominant cause is
-  bf16 *input* operands in DRAM, not bf16 *accumulation*, so an accumulator-only
-  fix does not help these ops. The same patch did fix the matmul K-explosion,
-  which was accumulation-bound.
-- Closing the reduce/softmax gap needs the deeper fix: keep operands fp32 in DRAM
-  (and feed fp32 to the FPU on Blackhole) — a tt-metal kernel property below
-  tt-xla, the same bottleneck that caps plain-matmul Qwen parity at ~0.93.
-- Related but separate: matmul operands appear to be stored bf16 in DRAM (error
-  ∝ contraction dim K; also visible as ~1.5e-2 error on a pure embedding
-  *gather*, which does no arithmetic). That stored-operand downcast is a distinct
-  mechanism from the compute-config issue documented here and is being chased
-  separately. Both must be fixed for plain-matmul + softmax Qwen parity with
-  `THESEUS_TT_SLOW_SAFE_LINEAR=0`.
+- Fixed locally: **attempted, ineffective.** A HiFi4 + `fp32_dest_acc_en` +
+  `packer_l1_acc` compute-config patch was built and deployed but left the
+  reduce/softmax op error byte-identical (see Verification). These ops are
+  input-bound, so an accumulator-only fix does not help them. The same patch *did*
+  fix the matmul K-explosion, which was accumulation-bound — see
+  [2026-06-03-tt-matmul-fp32-accumulation-precision](/home/houjun/lessons/2026-06-03-tt-matmul-fp32-accumulation-precision/README.md).
+- Closing the reduce/softmax gap needs the deeper fix: keep operands fp32 fed to
+  the FPU on Blackhole — a tt-metal kernel property below tt-xla.
+- Related but distinct: the embedding op casts its fp32 weight to bf16, which
+  shows up as ~1.5e-2 error on a pure gather (no arithmetic). That is a separate
+  op workaround, documented in
+  [2026-06-03-ttxla-fp32-embedding-bf16-cast](/home/houjun/lessons/2026-06-03-ttxla-fp32-embedding-bf16-cast/README.md).
 
 ## Repositories
 
 - `tt-xla` — `/home/houjun/tt-xla`, branch `main`, commit
-  `03f29ed01a2bca27f5d8eaace659534016c7d0c4`, worktree dirty (9 files; unrelated
+  `03f29ed01a2bca27f5d8eaace659534016c7d0c4`, worktree dirty (unrelated
   in-progress edits to CMakeLists.txt / buffer_instance.h / assert.h).
 - `tt-mlir` (submodule) —
   `/home/houjun/tt-xla/third_party/tt-mlir/src/tt-mlir`, commit
-  `412daacc440f10bb98ccc685c311b01f1fadab70`, worktree dirty (2 files).
-- `theseus` — `/home/houjun/theseus`, branch `feat/tenstorrent`, commit
-  `f085ca67fa68ef08d63668cd7f866b2b8147839e` (used only to source the op-probe
-  shapes; the reproducer below is theseus-free).
+  `412daacc440f10bb98ccc685c311b01f1fadab70`, worktree dirty (2 files; none touch
+  the softmax/reduction lowering).
 
 ## Host Environment
 
-Observed on `tt-qb-ac-02` (tt-qb2.stanford.edu):
+Observed on a host with 4× Blackhole `p150b`:
 
 ```text
 Linux 5.15.0-179-generic x86_64
-Python 3.10.12 (system); probe run under theseus uv venv Python 3.12
+Python 3.12 (probe venv)
 jax==0.7.1, jaxlib==0.7.1
 ARCH_NAME=blackhole
 ```
@@ -79,8 +74,8 @@ startup are benign single-chip warnings; execution completes normally.
 
 ## User-Visible Failure
 
-Per-op max/mean abs diff, CPU (f32) vs TT (f32 in, f32 out),
-`scripts/tt_op_probe.py softmax rmsnorm silu rope attn gather`:
+Per-op max/mean abs diff, CPU (f32) vs TT (f32 in, f32 out), on Qwen2.5-0.5B
+shapes:
 
 ```text
 [softmax            ] shape=(1, 14, 32, 32)   max=3.869e-02 mean=4.508e-04 relmax=6.469e-02
@@ -92,10 +87,10 @@ Per-op max/mean abs diff, CPU (f32) vs TT (f32 in, f32 out),
 ```
 
 Reading: softmax is ~400× worse (relative) than rms_norm; silu/rope are exact;
-the full attention block (matmul→softmax→matmul) has the worst mean; the pure
-gather shows bf16-magnitude error despite doing no arithmetic.
+the full attention block (matmul→softmax→matmul) has the worst mean. (The gather
+error belongs to the separate embedding-cast bug, linked above.)
 
-Pure-JAX controls isolate where softmax loses precision:
+Standalone JAX controls isolate where softmax loses precision:
 
 ```text
 control exp        [1,14,128,128]:  max 4.768e-07            (= f32 eps; EXACT)
@@ -119,40 +114,40 @@ reductions with no `compute_config` attribute:
 At runtime, a null compute config falls back to TTNN's default kernel config:
 
 - `runtime/lib/ttnn/operations/utils/utils.cpp:427-442` —
-  `createDeviceComputeKernelConfig` only sets `math_fidelity` /
-  `fp32_dest_acc_en` *if the flatbuffer carries them* (`if (config->math_fidelity())`,
+  `createDeviceComputeKernelConfig` sets `math_fidelity` / `fp32_dest_acc_en`
+  only *if the flatbuffer carries them* (`if (config->math_fidelity())`,
   `if (config->fp32_dest_acc_en())`); otherwise the TTNN default
-  `WormholeComputeKernelConfig` applies — LoFi math fidelity and
-  `fp32_dest_acc_en=false`, i.e. **bf16 destination accumulation**.
+  `WormholeComputeKernelConfig` applies — LoFi fidelity and
+  `fp32_dest_acc_en=false`, i.e. bf16 destination accumulation.
 
 By contrast, `ttnn.rms_norm` is rewritten to carry a max-precision config:
 
 - `lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/RMSNormConfigRewritePattern.cpp:30-36`
   — force-sets `MathFidelity::HiFi4`, `fp32_dest_acc_en=true`, `packer_l1_acc=true`.
 
-This asymmetry exactly matches the measured behavior: RMSNorm precise, softmax /
-reduce not. The StableHLO→TTIR→TTNN type system itself is f32-clean (1:1 type
-converters at `StableHLOToTTIRPass.cpp:57-58` and `TTIRToTTNNPass.cpp:61-63`;
-constants and ToLayout preserve dtype), so this is a compute-precision default,
-not a type cast.
+This asymmetry matches the measured behavior: RMSNorm precise, softmax/reduce not.
+The StableHLO→TTIR→TTNN type system itself is f32-clean (1:1 type converters at
+`StableHLOToTTIRPass.cpp:57-58` and `TTIRToTTNNPass.cpp:61-63`; constants and
+ToLayout preserve dtype), so this is a compute-precision default, not a type cast.
 
 ## Fix
 
-Not yet implemented. Proposed: mirror `RMSNormConfigRewritePattern` for the
-softmax and reduction lowerings — attach a `DeviceComputeKernelConfigAttr` with
-`MathFidelity::HiFi4` and `fp32_dest_acc_en=true` when building `ttnn.softmax`
-and the `ttnn` sum/max/min ops (either in the conversion patterns in
-`TTIRToTTNN.cpp`, or as analogous workaround rewrite patterns under
-`lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/`). That restores fp32
-accumulation for the reduction, the same way RMSNorm already gets it.
+Proposed: mirror `RMSNormConfigRewritePattern` for the softmax and reduction
+lowerings — attach a `DeviceComputeKernelConfigAttr` with `MathFidelity::HiFi4`
+and `fp32_dest_acc_en=true` when building `ttnn.softmax` and the `ttnn`
+sum/max/min ops (either in the `TTIRToTTNN.cpp` conversion patterns or as
+workaround rewrite patterns under
+`lib/Dialect/TTNN/Transforms/Workarounds/Decomposition/`).
 
-This is independent of the separate "matmul/stored operands are bf16 in DRAM"
-issue; fixing the compute config alone will not recover matmul precision.
+Caveat: as Verification shows, this restores fp32 accumulation but does **not**
+reduce the measured reduce/softmax error, because those ops are input-bound on
+Blackhole. The change is a correctness/consistency fix, not a precision win for
+these ops on this hardware.
 
 ## Minimal Reproducer
 
-`/home/houjun/lessons/2026-06-03-ttxla-softmax-reduce-bf16-accumulation/supplemental/repro_softmax_reduce_precision.py`
-(theseus-free pure JAX). It:
+[supplemental/repro_softmax_reduce_precision.py](/home/houjun/lessons/2026-06-03-ttxla-softmax-reduce-bf16-accumulation/supplemental/repro_softmax_reduce_precision.py)
+— standalone JAX, no model harness. It:
 
 1. Runs f32 `jax.nn.softmax` over attention-shaped logits `[1,14,S,S]` for
    S=32/128/512, CPU vs TT.
@@ -161,33 +156,25 @@ issue; fixing the compute config alone will not recover matmul precision.
    ~3e-2) — the key isolation.
 4. Runs f32 `log_softmax` over vocab=151936 (the loss path).
 
-Expected on the buggy build: `exp` ≈ f32 epsilon, but `reduce_sum` ≈ 3e-2 —
-proving the reduce accumulator is bf16. After the proposed fix, `reduce_sum`
-(and softmax) should drop toward f32 epsilon.
+Expected on the current build: `exp` ≈ f32 epsilon, but `reduce_sum` ≈ 3e-2 —
+the reduce accumulator runs at bf16 magnitude.
 
 ## Reproduction Steps
 
-On a host with a free Blackhole chip (here tt-qb2 chip 1):
+From a venv that has the TT PJRT plugin installed:
 
 ```bash
-cd /home/houjun/theseus
 source .venv/bin/activate
 export TT_VISIBLE_DEVICES=1 CONVERT_SHLO_TO_SHARDY=1 JAX_PLATFORMS=tt,cpu ARCH_NAME=blackhole
 export TTXLA_LOGGER_LEVEL=ERROR TTMLIR_RUNTIME_LOGGER_LEVEL=ERROR TT_METAL_LOGGER_LEVEL=ERROR
-
-# op-level survey (shapes from Qwen2.5-0.5B):
-python scripts/tt_op_probe.py softmax rmsnorm silu rope attn gather
-
-# pure-JAX isolation (exp vs reduce_sum):
 python /home/houjun/lessons/2026-06-03-ttxla-softmax-reduce-bf16-accumulation/supplemental/repro_softmax_reduce_precision.py
 ```
 
 ## Verification
 
-The unified compute-config patch (HiFi4 + `fp32_dest_acc_en` + `packer_l1_acc`
-on all `TTNNComputeKernelConfig` ops) was built and deployed to tt-qb2 by the
-primary agent, then this exact repro was re-run on the patched plugin. **The
-controls are byte-identical before and after:**
+The compute-config patch (HiFi4 + `fp32_dest_acc_en` + `packer_l1_acc` on all
+`TTNNComputeKernelConfig` ops) was built, deployed, and the repro re-run on the
+patched plugin. The controls are byte-identical before and after:
 
 ```text
                        BEFORE (unpatched)            AFTER (patched)
@@ -197,33 +184,26 @@ softmax S=32           max 2.024e-03                 max 2.024e-03
 log_softmax vocab      max 1.831e-04                 max 1.831e-04
 ```
 
-The same patch *did* dramatically fix matmul accumulation (primary's K-sweep:
-K=8192 10.5 → 0.61, K=4096 3.79 → 0.36), proving the fp32-accumulation config
-took effect for matmul. But it left `reduce_sum`/`softmax` **completely
-unchanged**. The best-supported explanation, given the pure-gather evidence
-(below), is that these ops are **input-bound, not accumulation-bound**: their f32
-operands are already truncated to bf16 on host→device upload (stored bf16 in
-DRAM), so promoting the *accumulator* to fp32 cannot recover precision that was
-already discarded. fp32 accumulation only helps when the inputs still carry the
-mantissa, as in the matmul K-explosion case.
+The same patch dramatically fixed matmul accumulation (K=8192: 10.5 → 0.61,
+K=4096: 3.79 → 0.36), proving the fp32-accumulation config took effect for
+matmul. It left `reduce_sum`/`softmax` unchanged. Given the operands reach these
+ops already at bf16 magnitude, the best-supported explanation is that they are
+input-bound, not accumulation-bound: promoting the accumulator to fp32 cannot
+recover precision the inputs already discarded. fp32 accumulation only helps when
+the inputs still carry the mantissa, as in the matmul K-explosion case.
 
-(Caveat: I did not dump the patched TTNN IR to confirm whether the generic
-`ttnn.sum` lowering actually received the config; the byte-identical result is
-equally consistent with the reduce pattern not being covered by the patch. Either
-way, the compute-config change is not the lever that closes the reduce/softmax
-gap.)
+Caveat: the patched TTNN IR was not dumped to confirm the generic `ttnn.sum`
+lowering actually received the config; the byte-identical result is equally
+consistent with the reduce pattern not being covered by the patch. Either way,
+the compute-config change is not the lever that closes the reduce/softmax gap.
 
 ## Notes
 
-- The reproducer's own softmax numbers look small (2e-3 at S=32, shrinking with
-  S) only because it feeds tiny logits (~N(0,1)/8) that make softmax nearly
-  uniform; the op-probe's realistic-magnitude logits give the full 3.9e-2. The
-  reduce_sum control, with O(1) summands, is the magnitude-independent signal.
+- The reproducer's softmax numbers look small (2e-3 at S=32, shrinking with S)
+  only because it feeds tiny logits (~N(0,1)/8) that make softmax nearly uniform;
+  realistic-magnitude logits give the full 3.9e-2. The `reduce_sum` control, with
+  O(1) summands, is the magnitude-independent signal.
 - The `relmax 7.49e+01` on the attention op is an artifact of near-zero reference
   entries; the meaningful figures there are mean 5.4e-3 / max 4.7e-2.
-- The pure-gather (`take/embed`) error of 1.5e-2 is *not* a reduction issue — a
-  gather does no math — and is evidence for the separate stored-operand-bf16
-  bug; it is noted here only to keep the two mechanisms distinct.
 - Both source worktrees were dirty when measured (unrelated in-progress edits);
-  none touch the softmax/reduction lowering, so the characterization is
-  unaffected.
+  none touch the softmax/reduction lowering.

@@ -223,26 +223,37 @@ mantissa-split operands (NVIDIA-Ampere "3×TF32" style) — a large change with 
 ~3× matmul cost — or keeping the Theseus chunked path (similar accuracy). HiFi4
 already does a 4-phase combine but tops out at ~TF32 on this part.
 
-### Definitive root cause (tt-metal source) and an emulation path
+### Definitive root cause (tt-metal source): TF32 ceiling, no software bug
 
-Located in tt-metal: the matmul **unpacker truncates fp32 SrcA/SrcB to bf16**
-(`Float16_b`) before the multiply — `get_single_unpack_dst_format`
-(`tt_metal/jit_build/data_format.cpp:119-132`): fp32 matmul src →
-`unpack_conditional_dst_format` = `Float16_b`. HiFi4 then runs its phases over
-bf16 inputs (the missing low mantissa reads as zero), so no fp32 is recovered.
-The higher-precision input mode is hard-disabled:
-`throw std::invalid_argument("TF32 unsupported atm")`
-(`tt_metal/impl/data_format/tile.cpp:93`). `fp32_dest_acc_en` widens only the DEST
-accumulator and `packer_l1_acc` only the L1/output accumulation — neither touches
-SrcA/SrcB width. So plain matmul is bf16-input on Blackhole by construction.
+The matmul input unpack format is decided in
+`tt_metal/jit_build/genfiles.cpp:285-288`:
 
-Two routes to higher precision (we own the stack):
-1. **Software bf16 mantissa-split (graph/compiler, no tt-metal rebuild):** since
-   inputs are truncated to bf16, split each operand `x = hi + lo` (hi = bf16(x),
-   lo = x − bf16(x)) and issue 3 matmuls `hi@hi + hi@lo + lo@hi`, summing on the
-   fp32-exact SFPU path. Validated on tt-qb2 (K=512): relmedian **1.45e-3 →
-   4.6e-4** (~3×; now accumulation-limited). This is the legitimate backend fix
-   (a `ttir.matmul`/`dot_general` decomposition pass), not model-level chunking.
+```cpp
+unpack_conditional_dst_format = (exp_prec==A) ? Float16 : Float16_b;   // fallback
+if (fp32_dest_acc_en && (is_all_fp32_formats(buf_dataformat_arr) || exp_prec==B))
+    unpack_conditional_dst_format = DataFormat::Tf32;                  // our case
+```
+
+With fp32 operands + `fp32_dest_acc_en=true` (opt0 default, ensured by the patch),
+the override fires and SrcA/SrcB are unpacked as **TF32 (~10 mantissa bits)** — the
+Blackhole matrix engine's *maximum* fp32 input precision (documented; only the SFPU
+does true fp32). HW confirms: matmul K=1 = **9.8 mantissa bits = TF32**, not bf16.
+(`Float16_b` is only the non-fp32_dest_acc fallback branch — not what runs here. The
+`"TF32 unsupported atm"` throw at `tile.cpp:93` is L1 tile-storage size bookkeeping,
+not the unpack-to-SrcReg path, which uses Tf32 fine.)
+
+So **there is no software bug in the matmul precision path**: tt-metal already feeds
+the FPU its highest-precision fp32 input (TF32). True fp32 SrcA/SrcB does not exist
+on the matrix engine — TF32 is the silicon ceiling. The ~0.63 residual is TF32
+(~1e-3/product) compounding over 24 layers. Practical parity (top-5 5/5, loss within
+~0.06) is the realistic best and is achieved unmodified.
+
+Exceeding TF32 is only possible via software multi-pass emulation (a `dot_general`
+decomposition issuing ~3 split matmuls summed on the fp32-exact SFPU). Validated on
+tt-qb2 but it tops out at **~12 mantissa bits** (3×bf16: 11.1–11.9b across K=16..1024;
+3×tf32 similar) at ~3× matmul cost — better than native TF32 but not bit-exact fp32,
+and not needed for top-5/loss parity. It is a workaround (like the Theseus chunked
+path), not a bug fix.
 2. **Native tt-metal fix:** implement/enable the disabled TF32 (or fp32) matmul
    input-unpack path on Blackhole — deep work, not a flag flip.
 

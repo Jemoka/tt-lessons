@@ -1,6 +1,6 @@
 """Pure-JAX reproducer: TT matmul does not achieve fp32 accumulation precision.
 
-Theseus-free. Compares CPU vs TT for plain fp32 matmuls and shows that:
+Standalone JAX. Compares CPU vs TT for plain fp32 matmuls and shows that:
   1. Error grows ~linearly with the contraction dimension K (signature of
      low-precision accumulation), even though operands are fp32.
   2. Forcing math_fidelity=hifi4 and fp32_dest_acc_en=true via compiler_options
