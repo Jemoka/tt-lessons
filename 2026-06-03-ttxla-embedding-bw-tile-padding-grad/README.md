@@ -21,8 +21,9 @@ is *not* affected — its dims are tile-aligned (vocab 151936 = 32×4748, hidden
 
 - Bug type: backend correctness — embedding-backward (gather-VJP scatter) reads/writes
   padded tile region, corrupting gradients for non-32-aligned shapes.
-- Component: tt-xla / tt-mlir embedding-backward lowering + tt-metal embedding_bw
-  kernel (exact layer not yet pinned to a file; characterized empirically on HW).
+- Component: the `ttnn.embedding_bw` op (the `stablehlo.scatter` gather-VJP is
+  converted to `ttir.embedding_backward` → `ttnn.embedding_bw`, IR-confirmed) — its
+  handling of the padded tile region. Not a generic scatter; not an accumulation bug.
 - Fixed locally: **No.** This is a characterization; root cause is pinned to tile
   padding (vocab/dim % 32 != 0), fix not yet implemented.
 - Scope: affects training (backward) only; forward gather is correct (separate bf16
@@ -94,9 +95,13 @@ loss), and `dim=1` is clean because there is no odd column — both consistent w
 padding-layout leak, not numeric rounding (a bf16 effect would not be exactly 1.0,
 nor parity-structured, nor vanish at tile-aligned sizes).
 
-The exact kernel/lowering line was not pinned; the empirical signature (tile-aligned
-⇒ correct, otherwise padding leak) localizes it to the embedding-backward tilize /
-scatter handling of the padded region.
+The op is `ttnn.embedding_bw`: a DEBUG IR dump shows the `stablehlo.scatter` that
+JAX emits for the gather VJP is converted to `ttir.embedding_backward` →
+`ttnn.embedding_bw` (not a generic scatter). That op does a correct scatter-ADD
+(duplicate-token accumulation verified exact across tile-aligned configs, including
+2-D `[B,S]` training-shaped indices and a token repeated 16×, all `max|cpu-tt|=0`);
+the defect is solely its handling of the padded tile region when vocab/dim are not
+multiples of 32, which leaks the cotangent into odd columns of even rows.
 
 ## Fix
 
@@ -149,3 +154,8 @@ The tile-aligned cases are exact; the non-aligned cases corrupt deterministicall
 - The spurious value equals the cotangent, so a non-`sum` loss would leak that loss's
   cotangent values into the same odd-column/even-row positions — the magnitude
   varies but the structure (tile padding) is the invariant.
+- Cross-validated: the primary's independent `max|cpu-tt|=1.0` came from a W=(16,8)
+  (non-aligned) repro — the same leak. A separate duplicate-accumulation audit (7
+  configs, all tile-aligned, including Qwen-ish and GPT vocab/embd) found `embedding_bw`
+  accumulates exactly (0.0), ruling out overwrite/last-wins. The two findings agree:
+  accumulation is correct; only the non-aligned padded-tile region leaks.
