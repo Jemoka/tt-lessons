@@ -1,0 +1,99 @@
+diff --git a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+index 8350e6c2a..ca9963ce9 100644
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp
+@@ -6157,11 +6157,15 @@ private:
+           "TTIR single dimensional scatter requires index_vector_dim to be 1");
+     }
+ 
+-    if (!multiDimensionalScatter && scatterDimsToOperandDims[0] != 0) {
+-      return rewriter.notifyMatchFailure(
+-          op, "TTIR single dimensional scatter currently only supports "
+-              "scattering along dimension 0");
+-    }
++    // Allow single-dimensional scatter on a non-0 operand dim. matchAndRewrite
++    // passes dim = scatter_dims_to_operand_dims[0] to ttir.scatter, and
++    // extractElementWiseScatterIndices() (below) builds the index tensor against
++    // the actual scatter axis, so any single scatter dim lowers correctly. This
++    // unblocks gather VJPs that scatter on a non-0 axis (e.g. RoPE rotate_half's
++    // jnp.take(axis=-1)), required for on-device training. Verified bit-exact vs
++    // CPU on Blackhole (repro_scatter_legalize.py: take-axis=-1 grad
++    // max|cpu-tt|=0.0), and a full GPT train step (with RoPE) trains on device.
++    // See lesson 2026-06-03-ttxla-scatter-not-legalized.
+     return success();
+   }
+ 
+@@ -6469,8 +6473,62 @@ private:
+     llvm::SmallVector<int64_t> indexShape(indexType.getShape());
+     ArrayRef<int64_t> updateShape = updateType.getShape();
+ 
+-    if (indexShape.size() < updateShape.size()) {
+-      // Need to reshape indices by appending 1s to the shape.
++    auto dimNumbers = op.getScatterDimensionNumbers();
++    ArrayRef<int64_t> updateWindowDims = dimNumbers.getUpdateWindowDims();
++    int64_t indexVectorDim = dimNumbers.getIndexVectorDim();
++    int64_t updateRank = static_cast<int64_t>(updateShape.size());
++
++    // The ttir.scatter index tensor must have the update tensor's shape, with
++    // each element giving the coordinate along the scatter dim. We must place
++    // the scatter index content on the right update axes:
++    //
++    //   - update_scatter_dims (update dims NOT in update_window_dims), in
++    //     increasing order, correspond — in order — to the batch dims of
++    //     scatter_indices (all its dims except index_vector_dim). This is the
++    //     StableHLO scatter contract.
++    //   - update_window_dims become size 1 here and are broadcast (repeated)
++    //     to the update size below.
++    //
++    // The legacy code appended trailing 1s, which only places content on the
++    // leading axes — correct solely when the scatter dim is 0 (e.g. embedding
++    // grad). Building the reshape from update_scatter_dims handles a scatter on
++    // any operand axis (e.g. RoPE rotate_half's jnp.take(axis=-1), whose VJP
++    // scatters on the last axis).
++    llvm::DenseSet<int64_t> windowDimSet(updateWindowDims.begin(),
++                                         updateWindowDims.end());
++    llvm::SmallVector<int64_t> updateScatterDims;
++    for (int64_t d = 0; d < updateRank; ++d) {
++      if (!windowDimSet.contains(d)) {
++        updateScatterDims.push_back(d);
++      }
++    }
++    llvm::SmallVector<int64_t> batchSizes;
++    for (int64_t d = 0; d < static_cast<int64_t>(indexShape.size()); ++d) {
++      if (d != indexVectorDim) {
++        batchSizes.push_back(indexShape[d]);
++      }
++    }
++
++    // Only remap when the scatter-index batch dims line up 1:1 with the update
++    // scatter dims; otherwise fall back to the legacy append-1s reshape.
++    bool canRemap = batchSizes.size() == updateScatterDims.size();
++    if (canRemap) {
++      llvm::SmallVector<int64_t> newShape(updateRank, 1);
++      for (size_t k = 0; k < updateScatterDims.size(); ++k) {
++        newShape[updateScatterDims[k]] = batchSizes[k];
++      }
++      bool sameShape = static_cast<int64_t>(indexShape.size()) == updateRank;
++      for (int64_t d = 0; sameShape && d < updateRank; ++d) {
++        sameShape = indexShape[d] == newShape[d];
++      }
++      if (!sameShape) {
++        indexTensor = ttir::utils::createReshapeOp(rewriter, op.getLoc(),
++                                                   indexTensor, newShape);
++        indexType = mlir::cast<RankedTensorType>(indexTensor.getType());
++        indexShape = newShape;
++      }
++    } else if (indexShape.size() < updateShape.size()) {
++      // Legacy fallback: append 1s to the shape.
+       llvm::SmallVector<int64_t> newShape(indexShape.begin(), indexShape.end());
+       newShape.resize(updateShape.size(), 1);
+ 
+@@ -6481,8 +6539,6 @@ private:
+     }
+ 
+     // Repeat along update_window_dims to match update tensor shape.
+-    ArrayRef<int64_t> updateWindowDims =
+-        op.getScatterDimensionNumbers().getUpdateWindowDims();
+     llvm::SmallVector<int64_t> repeatDims(indexShape.size(), 1);
+     bool needsRepeat = false;
+ 
