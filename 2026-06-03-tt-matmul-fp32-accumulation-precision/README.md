@@ -223,6 +223,29 @@ mantissa-split operands (NVIDIA-Ampere "3×TF32" style) — a large change with 
 ~3× matmul cost — or keeping the Theseus chunked path (similar accuracy). HiFi4
 already does a 4-phase combine but tops out at ~TF32 on this part.
 
+### Definitive root cause (tt-metal source) and an emulation path
+
+Located in tt-metal: the matmul **unpacker truncates fp32 SrcA/SrcB to bf16**
+(`Float16_b`) before the multiply — `get_single_unpack_dst_format`
+(`tt_metal/jit_build/data_format.cpp:119-132`): fp32 matmul src →
+`unpack_conditional_dst_format` = `Float16_b`. HiFi4 then runs its phases over
+bf16 inputs (the missing low mantissa reads as zero), so no fp32 is recovered.
+The higher-precision input mode is hard-disabled:
+`throw std::invalid_argument("TF32 unsupported atm")`
+(`tt_metal/impl/data_format/tile.cpp:93`). `fp32_dest_acc_en` widens only the DEST
+accumulator and `packer_l1_acc` only the L1/output accumulation — neither touches
+SrcA/SrcB width. So plain matmul is bf16-input on Blackhole by construction.
+
+Two routes to higher precision (we own the stack):
+1. **Software bf16 mantissa-split (graph/compiler, no tt-metal rebuild):** since
+   inputs are truncated to bf16, split each operand `x = hi + lo` (hi = bf16(x),
+   lo = x − bf16(x)) and issue 3 matmuls `hi@hi + hi@lo + lo@hi`, summing on the
+   fp32-exact SFPU path. Validated on tt-qb2 (K=512): relmedian **1.45e-3 →
+   4.6e-4** (~3×; now accumulation-limited). This is the legitimate backend fix
+   (a `ttir.matmul`/`dot_general` decomposition pass), not model-level chunking.
+2. **Native tt-metal fix:** implement/enable the disabled TF32 (or fp32) matmul
+   input-unpack path on Blackhole — deep work, not a flag flip.
+
 ## Notes
 
 - The earlier "device init hangs" on the original dev box were unrelated: that
