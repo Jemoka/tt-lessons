@@ -15,7 +15,7 @@ via a dedicated pattern, so the blocker was specifically non-axis-0 scatter.
 legality gate to admit a non-0 scatter axis, and rebuild the `ttir.scatter` index
 tensor against the *actual* scatter axis (using `update_scatter_dims`) instead of
 assuming dim 0. With the rebuilt plugin a last-axis scatter is **bit-exact vs CPU**
-and a full theseus GPT (with RoPE) **trains end-to-end on the device**.
+and a full GPT (with RoPE) **trains end-to-end on the device**.
 
 ## Status
 
@@ -32,14 +32,15 @@ and a full theseus GPT (with RoPE) **trains end-to-end on the device**.
   (`max|cpu-tt| = 0.0`); a 2-layer GPT with RoPE trained 30 steps on TT, loss
   11.63 → 6.94 (finite, monotonically decreasing; ln(vocab)=11.52).
 - No regression: the change is only reachable from the scatter rewrite, which is
-  never emitted by inference (forward) — so qwen inference MLIR is provably
-  unchanged. Empirically, qwen_parity on the rebuilt `.so` is deterministic and
-  tracks HF tightly (default "Hello world" prompt: top5 overlap 5/5, jax loss
+  never emitted by inference (forward) — so Qwen inference MLIR is provably
+  unchanged. Empirically, Qwen2.5-0.5B parity on the rebuilt `.so` is deterministic
+  and tracks HF tightly (default "Hello world" prompt: top5 overlap 5/5, jax loss
   5.534 vs hf 5.515, max diff 0.429 — within the TF32 matmul ceiling).
-- Remaining: the axis-0 embedding-gradient scatter still shows a ~1.0 diff vs CPU
-  with **repeated** indices (duplicate-token accumulation; pre-existing, separate
-  from this fix — see Notes). The `ttnn.scatter` runtime handled `dim > 0` as-is;
-  no runtime change was needed.
+- Remaining: the axis-0 embedding-gradient scatter shows a ~1.0 diff vs CPU at the
+  repro's non-aligned constant-index shape — a separate, pre-existing tile-padding
+  leak (not this fix), documented in
+  [2026-06-03-ttxla-embedding-bw-tile-padding-grad](/home/houjun/lessons/2026-06-03-ttxla-embedding-bw-tile-padding-grad/README.md).
+  The `ttnn.scatter` runtime handled `dim > 0` as-is; no runtime change was needed.
 
 ## Repositories
 
@@ -49,11 +50,9 @@ and a full theseus GPT (with RoPE) **trains end-to-end on the device**.
   independent of this gap).
 - tt-mlir submodule: `/home/houjun/tt-xla/third_party/tt-mlir/src/tt-mlir`
   (dirty — `StableHLOToTTIRPatterns.cpp` carries both hunks of this lesson's fix;
-  git hash `412daacc`). Rebuilt with clang-20 (surgical single-file recompile →
-  `ar r libTTMLIRStableHLOToTTIR.a` → relink) to produce the patched
-  `install/lib/libTTMLIRCompiler.so` (327 MB), installed on both this box and
-  `tt-qb2`. The fully-resolved link command is saved at `/tmp/ttmlir_link_cmd.sh`
-  and the single-file recompile at `/tmp/recompile_shlo.sh`, for fast relinks
+  git hash `412daacc`). Rebuilt with clang-20 via a surgical single-file recompile
+  (recompile `StableHLOToTTIRPatterns.cpp` → `ar r libTTMLIRStableHLOToTTIR.a` →
+  relink), producing the patched `install/lib/libTTMLIRCompiler.so` (327 MB)
   without a full superbuild.
 
 ## Host Environment
@@ -186,7 +185,7 @@ After changes (1)+(2) (final patch) — last-axis scatter runs and is **bit-exac
 [embed grad      ] TT grad OK   max|cpu-tt|=1.000e+00   (dup-index caveat unchanged)
 ```
 
-End-to-end: a 2-layer theseus GPT **with RoPE** trains on the device (the train
+End-to-end: a 2-layer GPT **with RoPE** trains on the device (the train
 step's backward emits the now-supported RoPE scatter):
 
 ```text
@@ -198,8 +197,8 @@ first loss 11.6270 -> last loss 6.9424  (finite=True, decreased=True)
 ln(vocab) reference = 11.5158
 ```
 
-Regression check — qwen_parity on the rebuilt plugin (default "Hello world"
-prompt, deterministic across two runs). The change only touches scatter lowering,
+Regression check — Qwen2.5-0.5B parity vs HF on the rebuilt plugin (default
+"Hello world" prompt, deterministic across two runs). The change only touches scatter lowering,
 which never appears in inference, so forward output is provably unchanged; the
 parity tracks HF tightly:
 
@@ -214,12 +213,13 @@ hf loss: 5.5148    jax loss: 5.5339
   11.68 → 6.61). This lesson is specifically about *on-device TT training*.
 - Forward-only TT use (inference) is unaffected — scatter only arises in
   gradients.
-- **Embedding duplicate-index caveat:** the axis-0 embedding-gradient scatter
-  legalizes, but with repeated indices the TT gradient differed from CPU by up to
-  1.0 — duplicate token positions may be **overwritten rather than scatter-added**.
-  If real, that silently corrupts training gradients (the most common case — a
-  token appearing twice in a batch). Worth a focused correctness probe before
-  trusting TT embedding training.
+- **Embedding non-aligned caveat:** the axis-0 embedding-gradient scatter
+  legalizes, but the ~1.0 diff vs CPU seen here is **not** a missing
+  scatter-add — accumulation is exact. It is the tile-padding leak documented in
+  [2026-06-03-ttxla-embedding-bw-tile-padding-grad](/home/houjun/lessons/2026-06-03-ttxla-embedding-bw-tile-padding-grad/README.md):
+  the repro's `W=(16,8)` is non-32-aligned and uses a constant index, the exact
+  trigger for that leak. With dynamic indices (real training) or tile-aligned
+  shapes the embedding gradient is correct.
 - **Model-side rotate_half rewrite is not a clean workaround anyway:** replacing
   RoPE's `jnp.take` with a bit-identical slice/concat (0.0 diff on CPU) removes the
   scatter but triggers a *separate* tt-metal compile crash in the forward on TT

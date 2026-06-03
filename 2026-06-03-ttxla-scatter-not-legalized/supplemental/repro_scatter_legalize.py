@@ -73,6 +73,12 @@ def try_grad(name, fn, inp):
 
 
 if __name__ == "__main__":
-    try_grad("gather (take)", f_gather, x)   # expect: failed to legalize stablehlo.scatter
-    try_grad("slice/concat", f_slice, x)     # expect: OK
-    try_grad("embed grad", f_embed, W)       # expect: failed (the unavoidable scatter)
+    # last-axis scatter: FAILS to legalize on a stock plugin; bit-exact (OK) with
+    # the ttmlir_scatter_nonzero_axis_fix patch applied.
+    try_grad("gather (take)", f_gather, x)
+    # scatter-free VJP: always OK.
+    try_grad("slice/concat", f_slice, x)
+    # axis-0 embedding grad: legalizes (EmbeddingBackward); the ~1.0 diff here is
+    # the non-aligned constant-index tile-padding leak (separate lesson), not a
+    # legalization failure.
+    try_grad("embed grad", f_embed, W)
