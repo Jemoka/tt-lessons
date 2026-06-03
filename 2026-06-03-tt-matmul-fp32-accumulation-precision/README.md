@@ -9,22 +9,30 @@ error that is bf16-level and grows ~linearly with the contraction dimension K
 (K=64 → ~0.04, K=8192 → ~10.5), even though the TTNN operands are fp32 and the
 op is compiled with `math_fidelity = hifi4` and `fp32_dest_acc_en = true`.
 
-The root cause is two gaps in the default TTNN compute-kernel-config, both
-fixable in tt-xla: (1) `packer_l1_acc` defaults to **false**, so matmul partial
-results packed to the same L1 address across K-blocks accumulate in low
-precision (error grows with K); (2) softmax and the generic reductions are
-lowered with a **null** compute_config, so at runtime they fall back to TTNN's
-default (LoFi + `fp32_dest_acc_en=false` → bf16). A one-spot tt-xla fix that sets
-HiFi4 + `fp32_dest_acc_en` + `packer_l1_acc` on every compute-kernel-config op
-removes the K-explosion (K=8192 abs error 10.5 → 0.61) and the softmax/reduce
-LoFi fallback, making the Theseus chunked "slow-safe" workaround unnecessary.
+There are two distinct layers here. Two gaps are **fixable in tt-xla** and are
+fixed by the attached patch: (1) `packer_l1_acc` defaults to **false**, so matmul
+partial results packed to the same L1 address across K-blocks accumulate in low
+precision (error grows with K); (2) softmax and the generic reductions lower with
+a **null** compute_config, falling back at runtime to TTNN's default (LoFi +
+`fp32_dest_acc_en=false` → bf16). The patch sets HiFi4 + `fp32_dest_acc_en` +
+`packer_l1_acc` on every compute-kernel-config op and removes the K-explosion
+(K=8192 abs error 10.5 → 0.61) and the softmax/reduce LoFi fallback.
+
+However, that does **not** close end-to-end Qwen parity. The dominant residual is
+a third, deeper issue **below tt-xla**: each TT matmul retains ~0.2–0.5 abs error
+from **bf16 input precision** even with fp32 operands + HiFi4 (HiFi4 does not
+recover fp32 from the fp32 inputs on this Blackhole), and that compounds across
+24 layers to ~0.63 (chunked) / ~0.93 (plain). Fixing it requires a tt-metal
+matmul-kernel change; until then the Theseus chunked "slow-safe" path remains the
+better-accuracy option (it limits per-matmul K).
 
 ## Status
 
-- Bug type: backend numeric precision (low-precision matmul accumulation)
-- Component: tt-metal matmul kernel (invoked via tt-xla → tt-mlir → TTNN); **not** the tt-xla compiler/layout
-- Fixed locally: no — root cause is below the tt-xla layer
-- Mitigation: Theseus `THESEUS_TT_SLOW_SAFE_LINEAR` chunks matmuls (K-blocks of 256), reducing per-matmul accumulation error; this is a workaround, not a fix
+- Bug type: backend numeric precision (low-precision matmul accumulation + LoFi softmax/reduce)
+- Component: tt-xla compute-kernel-config defaults (fixable here) + tt-metal matmul kernel bf16-input precision (below tt-xla)
+- Fixed locally: **partially** — the two tt-xla gaps (`packer_l1_acc=false`; null softmax/reduce compute_config) are fixed by the attached patch and verified (ksweep K=8192: 10.5 → 0.61). The dominant residual (bf16 matmul input precision) is a tt-metal kernel limit and is **not** fixed.
+- Net effect on Qwen parity: small (default path 0.629 → 0.637; the matmul-input limit dominates). Patch is a correctness improvement, not a parity silver bullet.
+- Mitigation still useful: Theseus `THESEUS_TT_SLOW_SAFE_LINEAR` chunks matmuls (K-blocks of 256), which limits the bf16-input error per matmul and gives better parity than plain matmul (0.63 vs 0.93).
 - Confirmed not the cause: HF→JAX weight mapping and the Theseus model (CPU parity is 8.5e-05, see Verification)
 
 ## Repositories
@@ -161,8 +169,42 @@ hf loss: 7.848437   jax loss: 7.925876
 
 The script runs to completion on Tenstorrent and the top-5 token set matches HF
 (5/5); the residual max-diff (0.63) is the un-eliminated tail of the matmul
-accumulation error. Closing it fully requires the tt-metal kernel fix (or a
-compiler-level large-K decomposition), not a model or tt-xla-compiler change.
+error.
+
+### Effect of the fix (patched plugin, tt-qb2)
+
+The patch removes the matmul K-explosion — `ksweep` (CPU vs TT), before → after:
+
+```text
+K=1024:  0.68 -> 0.19     K=4096: 3.79 -> 0.36     K=8192: 10.5 -> 0.61
+matmul down (K=4864): 4.35 -> 0.55     gate: 0.59 -> 0.22
+softmax: max 0.038, mean 4.7e-4 (clean; was a null-config LoFi fallback)
+```
+
+End-to-end `qwen_parity.py` on the patched plugin:
+
+```text
+slow-safe ON  (default):  max 0.637  top5 4  jax loss 7.909   (vs 0.629/5 unpatched)
+slow-safe OFF (plain mm):  max 0.931  top5 3  jax loss 7.896
+```
+
+Honest read: the patch is a genuine correctness fix (matmul K-block accumulation
+and softmax/reduce now run at fp32/HiFi4 instead of bf16/LoFi), but it does **not**
+materially change end-to-end Qwen parity. Two reasons:
+1. The default path already chunks matmuls (small K), so the packer fix has little
+   to add there; and fixing softmax/reduce LoFi did not move the needle, so
+   softmax was **not** the dominant residual (correcting the earlier hypothesis).
+2. The dominant remaining error is the **bf16 input precision of each TT matmul**:
+   even with fp32 operands + HiFi4 + fp32_dest_acc + packer_l1_acc, a single
+   matmul retains ~0.2–0.5 abs error (HiFi4 does not recover fp32 from the fp32
+   inputs on this Blackhole), which compounds across 24 layers to ~0.63 (chunked)
+   / ~0.93 (plain). That is a tt-metal matmul-kernel limitation **below the
+   tt-xla layer** and is not closable from tt-xla.
+
+So: `qwen_parity.py` runs unmodified on Tenstorrent and the top-5 tokens match HF;
+the two tt-xla precision gaps found here are fixed by the patch; full fp32 parity
+additionally requires a tt-metal fix to honor fp32 matmul inputs (or keeping the
+Theseus chunked path, which trades speed for the same accuracy).
 
 ## Notes
 
