@@ -245,6 +245,38 @@ mantissa bits (3×bf16: 11.1–11.9b across K=16..1024; 3×TF32 similar) at ~3×
 matmul cost — better than native TF32 but not bit-exact fp32, and not needed for
 top-5/loss parity. It is a workaround, not a bug fix.
 
+### Future work: turning the split into a tt-mlir compiler pass (not implemented)
+
+If the TF32 ceiling ever needs to be exceeded transparently (no model-side
+rewrite), the validated 3-split can be implemented as a TTIR decomposition pass.
+Design (scouted, not built — kept here as a recipe):
+
+- **Target op:** `ttir.MatmulOp`. Chain to it:
+  `stablehlo.dot_general` → `ttir.DotGeneralOp`
+  (`lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp:683`) →
+  `ttir.MatmulOp`
+  (`lib/Conversion/TTIRToTTIRDecomposition/TTIRToTTIRDecomposition.cpp:207-316`,
+  matmul created at `:287`). Decompose `ttir.MatmulOp` while operands are still f32.
+- **Template:** `lib/Dialect/TTIR/Transforms/DecomposeMinReduction.cpp` — the
+  walk → setInsertionPoint → create-sequence → replaceOp shape (~50 lines);
+  register in `include/ttmlir/Dialect/TTIR/Transforms/Passes.td` (see `:421`).
+- **Building blocks (all exist, `include/ttmlir/Dialect/TTIR/IR/TTIROps.td`):**
+  `ttir.typecast` (`:991`, f32↔bf16), `ttir.subtract` (`:1743`), `ttir.add`
+  (`:1870`), `ttir.matmul` (`:4789`). Emit
+  `A_hi=typecast(A,bf16); A_lo=A-A_hi; B_hi=…; result = A_hi@B_hi + A_hi@B_lo + A_lo@B_hi`.
+- **Insert point:** `lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp:57`, right after
+  `createTTIRToTTIRDecompositionPass()` (DotGeneral→Matmul done, operands still f32),
+  before the canonicalizer.
+- **⚠️ Critical gotcha:** the canonicalizer folds `typecast(f32→bf16)→typecast(bf16→f32)`
+  back to identity (`lib/Dialect/TTIR/IR/TTIROps.cpp:3414-3458`), which would erase
+  the split. Set **`conservative_folding=true`** on the generated typecasts
+  (attr at `TTIROps.td:1026`) or the pass silently no-ops.
+- The sub-matmuls run at bf16 unpack (operands become bf16-typed, so the TF32 path
+  does not fire on them — by design; the split is what recovers the bits).
+
+Status: future-work only. The patched build's TF32 already gives top-5/loss parity,
+so this pass was deliberately not implemented.
+
 ## Notes
 
 - `fp32_dest_acc_en=false` produced a *lower* max error (3.25) than the
