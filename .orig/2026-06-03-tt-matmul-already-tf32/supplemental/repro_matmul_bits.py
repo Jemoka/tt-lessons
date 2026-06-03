@@ -10,8 +10,7 @@ implied effective mantissa bits = -log2(rel_err). Small K isolates INPUT roundin
 bits (rel ~5e-4), fp32 ~23 bits (rel ~1e-7).
 
 Run (chip 1):
-  TT_VISIBLE_DEVICES=1 CONVERT_SHLO_TO_SHARDY=1 JAX_PLATFORMS=tt,cpu \
-    ARCH_NAME=blackhole python repro_matmul_bits.py
+  TT_VISIBLE_DEVICES=1 CONVERT_SHLO_TO_SHARDY=1 python /home/houjun/.agents/repro_matmul_bits.py
 """
 
 import os

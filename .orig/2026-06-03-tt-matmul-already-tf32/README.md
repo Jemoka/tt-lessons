@@ -2,57 +2,55 @@
 
 ## Summary
 
-The remaining Qwen2.5-0.5B parity residual on Tenstorrent Blackhole was attributed
-to the matmul FPU truncating fp32 operands to **bf16** (7 mantissa bits) at unpack.
-Direct measurement shows that is not what the patched build does: a matmul's
-effective input precision is **~9.96 mantissa bits at K=1 — i.e. TF32 (10 bits),
-not bf16**. The compiled TTNN IR confirms why: the matmul carries all-fp32
-operands/output and `fp32_dest_acc_en=true`, which is exactly the condition
-tt-metal uses to auto-select the TF32 unpack path for `SrcA`/`SrcB`.
+The remaining Qwen-parity residual on Tenstorrent Blackhole was attributed to the
+matmul FPU truncating fp32 operands to **bf16** (7 mantissa bits) at unpack. Direct
+measurement shows that is not what the patched build does: a matmul's effective
+input precision is **~9.96 mantissa bits at K=1 — i.e. TF32 (10 bits), not bf16**.
+The compiled TTNN IR confirms why: the matmul carries all-fp32 operands/output and
+`fp32_dest_acc_en=true`, which is exactly the condition tt-metal uses to auto-select
+the TF32 unpack path for SrcA/SrcB.
 
 Consequence: there is no "bf16 → tf32" fix left to make — it is already tf32, the
 matrix engine's documented maximum. The per-matmul ~1e-3 relative error (tf32),
 compounded across 24 layers, is the source of the ~0.93 plain-path residual. The
 only way to go beyond it on the matrix engine is a multi-pass scheme such as a
-3×bf16 (hi/lo) split (~14–16 effective bits), implemented as a compiler pass.
+3×bf16 (hi/lo) split (~14-16 effective bits), implemented as a compiler pass.
 
 ## Status
 
-- Finding type: measurement + IR confirmation; corrects a prior "bf16-input"
-  framing. (Not a bug — tf32 is the intended HW ceiling. Recorded as a lesson
-  because it overturned an active hypothesis and bounds what is fixable.)
+- Finding type: measurement + IR confirmation; corrects a prior "bf16-input" framing.
 - Component: tt-metal matmul unpack (Blackhole) as driven by the tt-xla/tt-mlir
-  compiled graph.
+  compiled graph; no bug — tf32 is the intended HW ceiling.
 - Actionable: the patched build already achieves tf32; the next precision lever is
-  a 3×bf16 matmul-decomposition compiler pass (target `ttir.MatmulOp`, template
-  `DecomposeMinReduction.cpp`, insert in
+  a 3×bf16 matmul-decomposition compiler pass (feasibility scouted separately:
+  target `ttir.MatmulOp`, template `DecomposeMinReduction.cpp`, insert in
   `lib/Dialect/TTNN/Pipelines/TTNNPipelines.cpp` after the TTIR decomposition pass,
-  and set `conservative_folding=true` on the generated typecasts so the
-  canonicalizer does not fold the f32→bf16→f32 split back to identity).
-- Related: the fixable matmul accumulation bug (`packer_l1_acc=false`) and the
-  patch referenced here are documented in
-  [2026-06-03-tt-matmul-fp32-accumulation-precision](/home/houjun/lessons/2026-06-03-tt-matmul-fp32-accumulation-precision/README.md).
+  and set `conservative_folding=true` on the generated typecasts so the canonicalizer
+  does not fold the f32→bf16→f32 split back to identity).
 
 ## Repositories
 
 - `tt-xla` — `/home/houjun/tt-xla`, branch `main`,
-  `03f29ed01a2bca27f5d8eaace659534016c7d0c4` (worktree dirty; the matmul
-  compute-config patch is applied).
+  `03f29ed01a2bca27f5d8eaace659534016c7d0c4` (worktree dirty, plus the primary's
+  matmul compute-config patch deployed to tt-qb2).
 - `tt-mlir` (submodule) — `/home/houjun/tt-xla/third_party/tt-mlir/src/tt-mlir`,
   `412daacc440f10bb98ccc685c311b01f1fadab70`.
 - `tt-metal` (nested) — under `tt-mlir/src/tt-mlir/third_party/tt-metal/src/tt-metal`.
+- `theseus` — `/home/houjun/theseus`, `feat/tenstorrent`,
+  `f085ca67fa68ef08d63668cd7f866b2b8147839e` (probes are theseus-free).
 
 ## Host Environment
 
-Linux 5.15.0-179 x86_64, 4× Blackhole p150b, jax/jaxlib 0.7.1,
-`ARCH_NAME=blackhole`. Probe pinned to chip 1 (`TT_VISIBLE_DEVICES=1`), patched
-plugin. Startup `TT_FATAL ... remote mmio` lines are benign single-chip warnings.
+`tt-qb-ac-02` (tt-qb2.stanford.edu), Linux 5.15.0-179 x86_64, 4× Blackhole p150b,
+jax/jaxlib 0.7.1, ARCH_NAME=blackhole. Probe pinned to chip 1
+(`TT_VISIBLE_DEVICES=1`), patched plugin. Startup `TT_FATAL ... remote mmio` lines
+are benign single-chip warnings.
 
 ## User-Visible Failure
 
-The plain matmul path (no K-chunking) on the patched plugin stays at max logit
-diff ~0.93, top5 overlap 3 — initially read as "bf16-input matmul." The question
-this lesson answers: is the matmul input really bf16, or already tf32?
+Plain-path (slow-safe OFF) qwen_parity on the patched plugin stays at max diff
+~0.93, top5 3 — read by the team as "bf16-input matmul." The question this lesson
+answers: is the matmul input really bf16, or already tf32?
 
 ## Root Cause
 
@@ -85,16 +83,15 @@ truncation.
 ```
 
    All operands and the output are `f32`, with `fp32_dest_acc_en = true`. Per
-   tt-metal `tt_metal/jit_build/genfiles.cpp:285-289`,
-   `fp32_dest_acc_en && is_all_fp32_formats` sets
-   `unpack_conditional_dst_format = DataFormat::Tf32` — i.e. fp32 operands are
-   converted to tf32 (not bf16) into `SrcA`/`SrcB`. The measurement in (1) is that
-   path working.
+   tt-metal `tt_metal/jit_build/genfiles.cpp:285-289`, `fp32_dest_acc_en && is_all_fp32_formats`
+   sets `unpack_conditional_dst_format = DataFormat::Tf32` — i.e. fp32 operands are
+   converted to tf32 (not bf16) into SrcA/SrcB. The measurement (1) is that path
+   working.
 
 3. tf32 is the documented matrix-engine maximum
    (`docs/source/tt-metalium/tt_metal/advanced_topics/compute_engines_and_dataflow_within_tensix.rst:168`:
-   "the matrix engine's maximum accuracy is TF32 (19 active bits) ... less than
-   full 32-bit precision"). So no compute-config change can exceed tf32 on the FPU.
+   "the matrix engine's maximum accuracy is TF32 (19 active bits) ... less than full
+   32-bit precision"). So no compute-config change can exceed tf32 on the FPU.
 
 ## Fix
 
@@ -102,16 +99,15 @@ None for the FPU — tf32 is the hardware ceiling and is already in effect. To g
 below ~1e-3 per matmul, decompose each matmul on the matrix engine:
 
 - 3×bf16 (hi/lo) split: `A_hi=bf16(A), A_lo=A-A_hi, B_hi=bf16(B), B_lo=B-B_hi`,
-  `result ≈ A_hi@B_hi + A_hi@B_lo + A_lo@B_hi` (~14–16 effective bits, rel ~1e-4).
-  Implement as a tt-mlir TTIR pass over `ttir.MatmulOp`; the sub-matmuls run at
-  bf16 unpack (operands become bf16-typed, so the tf32 path does not fire on them —
-  by design; the split is what recovers the bits).
+  `result ≈ A_hi@B_hi + A_hi@B_lo + A_lo@B_hi` (~14-16 effective bits, rel ~1e-4).
+  Implement as a tt-mlir TTIR pass over `ttir.MatmulOp`; the sub-matmuls run at bf16
+  unpack (operands become bf16-typed, so the tf32 path does not fire on them — by
+  design; the split is what recovers the bits).
 
-Trade-off: 3× the matmul work for ~10× lower error vs tf32.
+Trade-off: 3× the matmul work for ~10× lower error vs tf32. The model-side chunked
+"slow-safe" path is the alternative lever (bounds per-matmul K).
 
 ## Minimal Reproducer
-
-Two standalone JAX scripts, no model harness:
 
 - [supplemental/repro_matmul_bits.py](/home/houjun/lessons/2026-06-03-tt-matmul-already-tf32/supplemental/repro_matmul_bits.py)
   — measures effective mantissa bits of TT matmul inputs vs a float64 reference,
@@ -122,9 +118,8 @@ Two standalone JAX scripts, no model harness:
 
 ## Reproduction Steps
 
-From a venv that has the TT PJRT plugin installed:
-
 ```bash
+cd /home/houjun/theseus
 source .venv/bin/activate
 export TT_VISIBLE_DEVICES=1 CONVERT_SHLO_TO_SHARDY=1 JAX_PLATFORMS=tt,cpu ARCH_NAME=blackhole
 python /home/houjun/lessons/2026-06-03-tt-matmul-already-tf32/supplemental/repro_matmul_bits.py
@@ -141,8 +136,8 @@ matmul input precision (patched build, chip 1):
 IR: ttnn.matmul operands+output = f32, compute_config fp32_dest_acc_en=true
 ```
 
-Together: the tf32 unpack path is active; bf16 is not the input format. A
-bf16-input build would show ~7-8 bits.
+Together: the tf32 unpack path is active; bf16 is not the input format. A bf16-input
+build would show ~7-8 bits.
 
 ## Notes
 

@@ -1,6 +1,6 @@
 """Dump the compiled TTNN IR for a plain f32 matmul to inspect operand/output
-DataFormat and the matmul's compute_config — confirming the tf32 unpack path
-(which needs all-fp32 CBs + fp32_dest_acc_en) is what runs on Blackhole.
+DataFormat and the matmul's compute_config — to learn why the tf32 unpack path
+(which needs all-fp32 CBs + fp32_dest_acc_en) is not triggering on Blackhole.
 
 Runs a tiny f32@f32 matmul on TT with TTXLA_LOGGER_LEVEL=DEBUG so the plugin
 dumps vhlo/shlo/ttir/ttnn MLIR to stderr. We capture it; grep the ttnn stage for
