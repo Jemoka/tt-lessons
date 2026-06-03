@@ -2,46 +2,46 @@
 
 ## Summary
 
-A GPT pretraining run compiles and runs fine on CPU but fails to compile its
-**training step** on Tenstorrent: the backward pass emits `stablehlo.scatter`
-(scatter-add), which tt-xla's SHLO→TTIR conversion cannot legalize. Three distinct
+Theseus GPT pretraining runs fine on CPU but fails to compile its **training
+step** on Tenstorrent: the backward pass emits `stablehlo.scatter` (scatter-add),
+which tt-xla's SHLO→TTIR conversion cannot legalize. Concretely, three distinct
 gathers in the GPT forward each produce a scatter in their gradient and abort the
-compile one after another: the integer-label cross-entropy loss,
-`RoPE.rotate_half` (`jnp.take` of a permutation), and — unavoidably — the
-**token-embedding lookup** (whose VJP scatter-adds gradients back into the
-embedding table).
+compile one after another: the integer-label cross-entropy loss, `RoPE.rotate_half`
+(`jnp.take` of a permutation), and — unavoidably — the **token-embedding lookup**
+(whose VJP scatter-adds gradients back into the embedding table).
 
-Forward and inference are unaffected, because scatter only appears in the
-gradient. tt-xla legalizes `gather`/`stablehlo.dynamic_gather` for the forward but
-has no lowering for `stablehlo.scatter`, so any model that gathers in the forward
-cannot be trained on-device until scatter is supported.
+Forward / inference is unaffected (Qwen parity ran fine), because scatter only
+appears in the gradient. The one-line shape of the situation: tt-xla legalizes
+`gather`/`stablehlo.dynamic_gather` for the forward but has no lowering for
+`stablehlo.scatter`, so **any model that gathers in the forward cannot be trained
+on-device** until scatter is supported.
 
 ## Status
 
 - Bug type: backend lowering gap (unsupported op in SHLO→TTIR).
 - Component: tt-xla / tt-mlir SHLO→TTIR conversion (`stablehlo.scatter`).
-- Fixed locally: **no.** Documented and isolated. Model-side workarounds remove
+- Fixed locally: **no.** Documented + isolated. Model-side workarounds remove
   *some* scatters (one-hot loss, slice-based rotate_half) but **cannot** remove
-  the embedding-gradient scatter, so a real fix requires scatter legalization.
+  the embedding-gradient scatter — so a real fix requires scatter legalization.
 - Impact: TT inference/forward works; TT on-device **training** of any
   embedding/gather-using model (i.e. essentially all transformers) is blocked.
-- Reproduced: standalone pure-JAX, and via a GPT pretraining step.
+- Reproduced: standalone pure-JAX (no theseus) + via theseus GPT pretraining.
 
 ## Repositories
 
 - TT-XLA: `/home/houjun/tt-xla`, branch `main`, commit `03f29ed01` (dirty; the
-  patched plugin from
-  [2026-06-03-tt-matmul-fp32-accumulation-precision](/home/houjun/lessons/2026-06-03-tt-matmul-fp32-accumulation-precision/README.md)
-  was running, but the gap is independent of that patch).
+  patched plugin from the matmul-precision lesson is what was running).
+- Theseus: `/home/houjun/theseus`, branch `feat/tenstorrent` (dirty).
 
 ## Host Environment
 
-- 4× Blackhole `p150b`, Python 3.12.13, JAX/jaxlib 0.7.1.
+- tt-qb2 (`tt-qb-ac-02`): 4× Blackhole `p150b`, Python 3.12.13, JAX/jaxlib 0.7.1.
 - Run on chip 0 (`TT_VISIBLE_DEVICES=0`, `CONVERT_SHLO_TO_SHARDY=1`).
 
 ## User-Visible Failure
 
-A GPT training step on TT aborts during compile. First the loss gather:
+`theseus run gpt/train/pretrain` (or a standalone train step) on TT aborts during
+compile. First the loss gather:
 
 ```text
 loc(... "softmax_cross_entropy_with_integer_labels" ... "jit(step)/transpose(jvp(jit(_take)))" ...)
@@ -67,7 +67,8 @@ legalization for `stablehlo.scatter`**, so the gradient graph fails to compile.
 Sources of gather (hence scatter-in-backward) on the GPT pretraining path:
 
 1. `optax.softmax_cross_entropy_with_integer_labels` — gathers the target-class
-   logit; VJP scatters. *Avoidable*: use one-hot + `log_softmax`.
+   logit; VJP scatters. *Avoidable*: use one-hot + `log_softmax` (the theseus
+   model's own loss already does this).
 2. `RoPE.rotate_half` (`rope.py:45`) — `jnp.take` of an index permutation; VJP
    scatters. *Avoidable*: `concatenate([-x2, x1])` slicing is bit-identical and
    scatter-free (verified, 0.0 diff).
@@ -80,10 +81,10 @@ support; (1)/(2) are not enough.
 
 ## Fix
 
-Proper fix: add `stablehlo.scatter` legalization to the tt-mlir SHLO→TTIR
-conversion (lower to a TTIR scatter / `embedding_bw`-style op). This is a tt-mlir
-change + rebuild, not a flag flip, and unblocks all gather-VJP cases at once. Not
-done here.
+Proper fix (etiological): add `stablehlo.scatter` legalization to the tt-mlir
+SHLO→TTIR conversion (lower to a TTIR scatter / `embedding_bw`-style op). This is
+a tt-mlir change + rebuild, not a flag flip, and unblocks all gather-VJP cases at
+once. Not done here.
 
 Partial model-side mitigations (insufficient alone, but reduce scatter count):
 
@@ -101,10 +102,8 @@ slice-based one, on CPU vs TT.
 
 ## Reproduction Steps
 
-From a venv that has the TT PJRT plugin installed:
-
 ```bash
-source .venv/bin/activate
+source /home/houjun/theseus/.venv/bin/activate
 TT_VISIBLE_DEVICES=0 CONVERT_SHLO_TO_SHARDY=1 JAX_PLATFORMS=tt,cpu ARCH_NAME=blackhole \
   python /home/houjun/lessons/2026-06-03-ttxla-scatter-not-legalized/supplemental/repro_scatter_legalize.py
 ```
@@ -121,8 +120,9 @@ is bit-exact vs CPU.
 
 ## Notes
 
-- The GPT pretraining path itself is correct and trains fine on CPU (loss
-  11.68 → 6.61). This lesson is specifically about *on-device TT training*.
-- Forward-only TT use (inference) is unaffected — scatter only arises in
-  gradients.
+- The synthetic GPT pretraining path itself is correct and trains fine on CPU
+  (loss 11.68 → 6.61; see the synthetic-data harness). This lesson is specifically
+  about *on-device TT training*, not the harness.
+- Forward-only TT use (inference, qwen_parity) is unaffected — scatter only
+  arises in gradients.
 - Same arch/LLK on Wormhole and Blackhole; expect the same gap there.

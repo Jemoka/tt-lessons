@@ -1,6 +1,6 @@
 """Pure-JAX reproducer: tt-xla cannot legalize stablehlo.scatter (blocks training).
 
-Standalone JAX. A forward gather (jnp.take / advanced indexing) is
+Standalone JAX, no theseus. A forward gather (jnp.take / advanced indexing) is
 fine on TT, but its GRADIENT is a stablehlo.scatter (scatter-add), which tt-xla's
 SHLO->TTIR conversion fails to legalize. This breaks on-device training of any
 model that gathers in the forward pass (RoPE rotate_half, integer-label
@@ -32,8 +32,8 @@ cpu = jax.devices("cpu")[0]
 D = 64
 x = np.random.default_rng(0).standard_normal((8, D)).astype(np.float32)
 
-# rotate_half via gather: take a permutation of the last-dim indices.
-# Forward is a gather; VJP is scatter-add.
+# rotate_half via gather (what theseus rope.py does): take a permutation of the
+# last-dim indices. Forward is a gather; VJP is scatter-add.
 half = D // 2
 perm = np.concatenate([np.arange(half, D), np.arange(half)]).astype(np.int32)
 signs = np.concatenate([-np.ones(D - half), np.ones(half)]).astype(np.float32)
