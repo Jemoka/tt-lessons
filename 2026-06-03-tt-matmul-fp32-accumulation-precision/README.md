@@ -19,18 +19,21 @@ a **null** compute_config, falling back at runtime to TTNN's default (LoFi +
 (K=8192 abs error 10.5 → 0.61) and the softmax/reduce LoFi fallback.
 
 However, that does **not** close end-to-end Qwen parity. The dominant residual is
-a third, deeper issue **below tt-xla**: each TT matmul retains ~0.2–0.5 abs error
-from **bf16 input precision** even with fp32 operands + HiFi4 (HiFi4 does not
-recover fp32 from the fp32 inputs on this Blackhole), and that compounds across
-24 layers to ~0.63 (chunked) / ~0.93 (plain). Fixing it requires a tt-metal
-matmul-kernel change; until then the Theseus chunked "slow-safe" path remains the
-better-accuracy option (it limits per-matmul K).
+a third, deeper issue **below both tt-xla and tt-metal software**: the Blackhole
+matmul FPU (matrix engine) runs fp32 inputs at **TF32 (~10 mantissa bits)** — a
+hardware ceiling. Isolation tests show fp32 storage and the SFPU/eltwise path are
+bit-exact (0 error), and a single matmul product (K=1) lands at ~9.8 mantissa
+bits (TF32). That ~1e-3 per-product error compounds across 24 layers to ~0.63
+(chunked) / ~0.93 (plain). Bit-exact fp32 is not achievable on the matrix engine;
+the only routes are a 3×TF32 mantissa-split software emulation (~3× matmul cost)
+or the Theseus chunked path (similar accuracy). Practical parity — top-5 tokens
+match HF 5/5, losses within ~0.06 — is achieved at the hardware's matmul precision.
 
 ## Status
 
 - Bug type: backend numeric precision (low-precision matmul accumulation + LoFi softmax/reduce)
-- Component: tt-xla compute-kernel-config defaults (fixable here) + tt-metal matmul kernel bf16-input precision (below tt-xla)
-- Fixed locally: **partially** — the two tt-xla gaps (`packer_l1_acc=false`; null softmax/reduce compute_config) are fixed by the attached patch and verified (ksweep K=8192: 10.5 → 0.61). The dominant residual (bf16 matmul input precision) is a tt-metal kernel limit and is **not** fixed.
+- Component: tt-xla compute-kernel-config defaults (fixable here) + Blackhole matmul-FPU TF32 input precision (hardware ceiling, below all software)
+- Fixed locally: **partially** — the two tt-xla gaps (`packer_l1_acc=false`; null softmax/reduce compute_config) are fixed by the attached patch and verified (ksweep K=8192: 10.5 → 0.61). The dominant residual is the matrix engine's **TF32 (~10-bit) fp32-input ceiling** — a hardware limit, **not** fixable in software short of a 3×TF32 emulation.
 - Net effect on Qwen parity: small (default path 0.629 → 0.637; the matmul-input limit dominates). Patch is a correctness improvement, not a parity silver bullet.
 - Mitigation still useful: Theseus `THESEUS_TT_SLOW_SAFE_LINEAR` chunks matmuls (K-blocks of 256), which limits the bf16-input error per matmul and gives better parity than plain matmul (0.63 vs 0.93).
 - Confirmed not the cause: HF→JAX weight mapping and the Theseus model (CPU parity is 8.5e-05, see Verification)
@@ -194,17 +197,31 @@ materially change end-to-end Qwen parity. Two reasons:
 1. The default path already chunks matmuls (small K), so the packer fix has little
    to add there; and fixing softmax/reduce LoFi did not move the needle, so
    softmax was **not** the dominant residual (correcting the earlier hypothesis).
-2. The dominant remaining error is the **bf16 input precision of each TT matmul**:
-   even with fp32 operands + HiFi4 + fp32_dest_acc + packer_l1_acc, a single
-   matmul retains ~0.2–0.5 abs error (HiFi4 does not recover fp32 from the fp32
-   inputs on this Blackhole), which compounds across 24 layers to ~0.63 (chunked)
-   / ~0.93 (plain). That is a tt-metal matmul-kernel limitation **below the
-   tt-xla layer** and is not closable from tt-xla.
+2. The dominant remaining error is the **TF32 input precision of the matmul FPU**
+   (the matrix engine), which is a Blackhole **hardware ceiling**, not a bf16
+   truncation bug. Isolation experiments on tt-qb2:
 
-So: `qwen_parity.py` runs unmodified on Tenstorrent and the top-5 tokens match HF;
-the two tt-xla precision gaps found here are fixed by the patch; full fp32 parity
-additionally requires a tt-metal fix to honor fp32 matmul inputs (or keeping the
-Theseus chunked path, which trades speed for the same accuracy).
+   ```text
+   pure fp32 device roundtrip (no compute):   max 0.000   (storage is EXACT fp32)
+   identity  a+0.0  on device (SFPU path):    max 0.000   (vector/eltwise is fp32-clean)
+   matmul K=1 (single product, no accum):     relmedian 1.16e-3  ~= 9.8 mantissa bits == TF32
+   gather (jnp.take):                          mean 1.1e-3  (~tf32 datacopy)
+   ```
+
+   So fp32 is stored and moved exactly; only ops that go through the **matrix
+   engine** drop to ~10-bit (TF32) — that is the maximum precision the Blackhole
+   matmul FPU provides for fp32 inputs under HiFi4. TF32 (~1e-3 per product)
+   compounds across 24 layers to ~0.63 (chunked) / ~0.93 (plain). This is below
+   tt-xla and below tt-metal software — it is the silicon's matmul precision.
+
+So: `qwen_parity.py` runs unmodified on Tenstorrent and the top-5 tokens match HF
+(5/5) with losses within ~0.06 — i.e. practical parity at the hardware's matmul
+precision. The two tt-xla precision gaps found here are real and fixed by the
+patch. **Bit-exact fp32 parity is not achievable on the matrix engine**: the only
+route is a software fp32-emulation that issues each matmul as ~3 TF32 matmuls on
+mantissa-split operands (NVIDIA-Ampere "3×TF32" style) — a large change with a
+~3× matmul cost — or keeping the Theseus chunked path (similar accuracy). HiFi4
+already does a 4-phase combine but tops out at ~TF32 on this part.
 
 ## Notes
 
