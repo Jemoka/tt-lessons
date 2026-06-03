@@ -9,12 +9,15 @@ error that is bf16-level and grows ~linearly with the contraction dimension K
 (K=64 → ~0.04, K=8192 → ~10.5), even though the TTNN operands are fp32 and the
 op is compiled with `math_fidelity = hifi4` and `fp32_dest_acc_en = true`.
 
-This is **not** a tt-xla compiler/layout bug: the emitted TTNN IR is correct
-(fp32 tile operands, HiFi4, fp32 dest accumulation). The precision loss happens
-in tt-metal's matmul kernel execution on Blackhole — the requested fp32
-accumulation is not honored, so accumulation is effectively low-precision. There
-is no fix purely inside tt-xla; the chunked "slow-safe linear" workaround in
-Theseus mitigates it by shrinking K per matmul.
+The root cause is two gaps in the default TTNN compute-kernel-config, both
+fixable in tt-xla: (1) `packer_l1_acc` defaults to **false**, so matmul partial
+results packed to the same L1 address across K-blocks accumulate in low
+precision (error grows with K); (2) softmax and the generic reductions are
+lowered with a **null** compute_config, so at runtime they fall back to TTNN's
+default (LoFi + `fp32_dest_acc_en=false` → bf16). A one-spot tt-xla fix that sets
+HiFi4 + `fp32_dest_acc_en` + `packer_l1_acc` on every compute-kernel-config op
+removes the K-explosion (K=8192 abs error 10.5 → 0.61) and the softmax/reduce
+LoFi fallback, making the Theseus chunked "slow-safe" workaround unnecessary.
 
 ## Status
 
