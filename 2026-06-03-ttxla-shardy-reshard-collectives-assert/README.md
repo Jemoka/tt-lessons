@@ -31,7 +31,16 @@ the reshard at all for single-device runs.
   `shardy/dialect/sdy/transforms/export/reshard_to_collectives.cc:394` (in
   `~/.cache/ttmlir-toolchain/src/shardy`). Reached via the tt-xla pass pipeline
   (`mlir::PassManager::run` → reshard_to_collectives).
-- Fixed locally: **no.** Root-caused and reduced to a pure-JAX reproducer.
+- Fixed locally: **framework-side workaround landed** (the Shardy compiler itself
+  is unpatched). `theseus/training/base.py` gates the tensor-parallel sharding rules:
+  `BaseTrainer._mesh_sharding_rules(model, mesh)` rewrites every `"shard"` rule to
+  replicated when `mesh.shape[SHARD] == 1`, so no `sdy.ReshardOp` is emitted on a
+  single device. All 5 trainer `logical_to_mesh_sharding(rules=...)` sites (base ×2,
+  lora ×2, contrastive, kl_divergence) route through it. Inert when `SHARD > 1`;
+  CPU-validated (`gpt/train/pretrain` completes). This clears the Shardy crash; the
+  trainer then hits a separate `ttnn.reshape` runtime gap (see Notes). The pure-JAX
+  repro still aborts (it bypasses the framework guard) and documents the underlying
+  compiler bug, which a defense-in-depth upstream fix would close (see Fix).
 - Independent of the scatter fix
   ([2026-06-03-ttxla-scatter-not-legalized](/home/houjun/lessons/2026-06-03-ttxla-scatter-not-legalized/README.md)):
   this aborts before any scatter is reached, and reproduces with no gather/scatter
