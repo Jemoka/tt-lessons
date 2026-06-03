@@ -30,24 +30,41 @@ scatter only appears in gradients (which is why qwen_parity forward works).
 
 ## Status
 
-- Bug type: backend lowering gap — narrow `stablehlo.scatter` legality in SHLO→TTIR.
-- Component: tt-mlir `StableHLOToTTIRScatterOpConversionPattern::checkBasicLegality`
-  (`StableHLOToTTIRPatterns.cpp:6086`).
-- Fixed locally: **no** (needs a tt-mlir rebuild). Isolated precisely: axis-0
-  scatter (embedding grad) already legalizes; non-axis-0 scatter (RoPE `jnp.take`
-  VJP) does not.
-- Impact: TT inference/forward works; embedding-gradient training works; on-device
-  training of models that **gather on a non-0 axis in the forward** (e.g. RoPE via
-  `jnp.take`) is blocked.
+- Bug type: backend lowering gap — narrow `stablehlo.scatter` legality in SHLO→TTIR,
+  *plus* a second dim-0 assumption in the index-construction that follows.
+- Component: tt-mlir, two spots in
+  `lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp`:
+  (1) `StableHLOToTTIRScatterOpConversionPattern::checkBasicLegality` (~`:6086`)
+  and (2) `extractElementWiseScatterIndices` (~`:6463`).
+- Fixed locally: **partially.** The legality check (1) was relaxed and the
+  plugin rebuilt (clang-20, patched `libTTMLIRCompiler.so`); a non-axis-0 scatter
+  now **passes legalization** — but it then fails downstream in (2), which still
+  assumes scatter dim 0 and emits a wrong `ttir.repeat` (shape mismatch). So the
+  relax is **necessary but not sufficient**; non-axis-0 scatter still cannot
+  compile end-to-end.
+- No regression: with the patched/rebuilt `.so`, qwen_parity is byte-identical to
+  baseline (max diff 0.637, top5 4, jax loss 7.909) — the relax is inert for
+  inference (scatter only appears in gradients).
+- Impact: TT inference/forward works; embedding-gradient training (axis-0) works;
+  on-device training of models that **gather on a non-0 axis in the forward**
+  (e.g. RoPE via `jnp.take`) is still blocked, now one layer deeper.
 - Reproduced: standalone pure-JAX (gather/take VJP fails, slice/concat OK, embed
-  axis-0 OK), and via a GPT pretraining step.
+  axis-0 OK), and via a GPT pretraining step. After the relax, the take-VJP error
+  moved from "failed to legalize stablehlo.scatter" to a `ttir.repeat` shape
+  mismatch in index construction.
 
 ## Repositories
 
-- TT-XLA: `/home/houjun/tt-xla`, branch `main`, commit `03f29ed01` (dirty; the
-  patched plugin from
-  [2026-06-03-tt-matmul-fp32-accumulation-precision](/home/houjun/lessons/2026-06-03-tt-matmul-fp32-accumulation-precision/README.md)
-  was running, but the gap is independent of that patch).
+- TT-XLA: `/home/houjun/tt-xla`, branch `main`, commit `03f29ed01` (dirty; carries
+  the matmul-precision patch from
+  [2026-06-03-tt-matmul-fp32-accumulation-precision](/home/houjun/lessons/2026-06-03-tt-matmul-fp32-accumulation-precision/README.md),
+  independent of this gap).
+- tt-mlir submodule: `/home/houjun/tt-xla/third_party/tt-mlir/src/tt-mlir`
+  (dirty — `StableHLOToTTIRPatterns.cpp` carries the legality relax from this
+  lesson). Rebuilt with clang-20 to produce the patched
+  `install/lib/libTTMLIRCompiler.so` (327 MB); the stock `.so` is backed up at
+  `/tmp/libTTMLIRCompiler.so.orig.bak`. The fully-resolved link command is saved
+  at `/tmp/ttmlir_link_cmd.sh` for fast future relinks without a full superbuild.
 
 ## Host Environment
 
@@ -101,18 +118,41 @@ scatter (item 3) already works.
 
 ## Fix
 
-Broaden `StableHLOToTTIRScatterOpConversionPattern::checkBasicLegality`
-(`StableHLOToTTIRPatterns.cpp:6086`) to accept scatter on a non-0 operand dim
-(map to `ttir.scatter` with the right `dim`), so last-axis gather VJPs (RoPE etc.)
-legalize. The full TTIR→TTNN→runtime scatter stack already exists
-(`ttir.scatter`→`ttnn.scatter`→`runtime/.../data_movement/scatter.cpp`). This is a
-tt-mlir change + rebuild. Not done here (the tt-mlir superbuild is impractical to
-rebuild in this environment; see the matmul-precision lesson's build notes).
+Two changes are required; only the first was made here.
+
+**(1) Relax the legality gate — DONE.**
+`StableHLOToTTIRScatterOpConversionPattern::checkBasicLegality`
+(`StableHLOToTTIRPatterns.cpp:~6086`) rejected single-dim scatter unless
+`scatter_dims_to_operand_dims[0] == 0`. That `notifyMatchFailure` was removed
+(replaced with `return success();`), and the plugin was rebuilt
+(clang-20 — see Notes on the toolchain). A non-axis-0 scatter now legalizes.
+Patch: [supplemental/ttmlir_scatter_legality_relax.patch](/home/houjun/lessons/2026-06-03-ttxla-scatter-not-legalized/supplemental/ttmlir_scatter_legality_relax.patch).
+
+**(2) Generalize index construction — NOT DONE (the remaining blocker).**
+`extractElementWiseScatterIndices` (`StableHLOToTTIRPatterns.cpp:~6463`) builds
+the `ttir.scatter` index tensor assuming scatter dim 0: it reshapes the index by
+appending trailing `1`s (placing the scattered content on dim 0) and then
+`ttir.repeat`s it along the `update_window_dims`. For a last-axis scatter (RoPE
+`rotate_half`, index shape `(64,)`, update shape `(8,64)`) this produces a
+`ttir.repeat` from `(64,1)` that cannot reach `(8,64)`:
+
+```text
+error: 'ttir.repeat' op Input tensor shape (64,1) does not repeat to output (8,64)
+```
+
+Finishing non-axis-0 scatter means rebuilding this index tensor against the actual
+scatter dim (place content on `scatter_dims_to_operand_dims[0]`, repeat along the
+other window dims) — and then confirming the `ttnn.scatter` runtime
+(`runtime/.../data_movement/scatter.cpp`) handles `dim > 0`. The TTIR→TTNN→runtime
+scatter stack exists, but its dim-0 assumptions have not been audited past the
+legality check.
 
 Partial model-side mitigations (insufficient alone, but reduce scatter count):
 
 - Loss: one-hot + `log_softmax` instead of integer-label gather.
-- RoPE: slice/concat `rotate_half` instead of `jnp.take`.
+- RoPE: slice/concat `rotate_half` instead of `jnp.take` — but this introduced a
+  *separate* tt-metal forward crash on TT (see Notes), so it is not a clean
+  workaround.
 
 These do not remove the embedding-gradient scatter, so they do not enable TT
 training by themselves.
@@ -137,15 +177,31 @@ TT_VISIBLE_DEVICES=0 CONVERT_SHLO_TO_SHARDY=1 JAX_PLATFORMS=tt,cpu ARCH_NAME=bla
 
 ## Verification
 
+Before the relax (stock plugin):
+
 ```text
 [gather (take)   ] TT grad FAILED: INTERNAL: Error code: 13   (last-axis scatter: failed to legalize stablehlo.scatter)
 [slice/concat    ] TT grad OK   max|cpu-tt|=0.000e+00
 [embed grad      ] TT grad OK   max|cpu-tt|=1.000e+00   (axis-0 scatter via EmbeddingBackward; see duplicate-index caveat)
 ```
 
-The last-axis gather VJP aborts the TT compile; the slice/concat gradient is
-bit-exact; the axis-0 embedding gradient **legalizes and runs** (its ~1.0 diff is
-the duplicate-index accumulation caveat, not a legalization failure).
+After the relax (patched/rebuilt plugin) the last-axis gather VJP gets **past
+legalization** and fails one layer deeper, confirming the legality gate was the
+first (but not only) blocker:
+
+```text
+[gather (take)   ] TT grad FAILED: 'ttir.repeat' op Input (64,1) does not repeat to (8,64)   (index construction still assumes dim 0)
+[slice/concat    ] TT grad OK   max|cpu-tt|=0.000e+00
+[embed grad      ] TT grad OK   max|cpu-tt|=1.000e+00
+```
+
+Regression check — qwen_parity on the patched/rebuilt plugin is byte-identical to
+the pre-patch baseline (scatter is inert for inference):
+
+```text
+max diff: 0.6373   mean diff: 0.0933   top5 overlap: 4   roundtrip 0.0
+hf loss: 7.8484    jax loss: 7.9089
+```
 
 ## Notes
 
