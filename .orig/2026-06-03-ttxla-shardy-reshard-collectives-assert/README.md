@@ -1,11 +1,11 @@
-# TT-XLA Aborts in Shardy `reshard_to_collectives` (`isDone()`) on a Size-1 Shard Axis
+# TT-XLA Aborts in Shardy `reshard_to_collectives` (`isDone()`) — Blocks the Theseus Trainer
 
 ## Summary
 
-A GPT trains fine on Tenstorrent via a plain-`jit` path, but a trainer that
-applies a **tensor-parallel sharding plan** aborts during compile with a hard C++
-assertion — not a graceful legalization failure — deep in the Shardy dialect's
-reshard→collectives export pass:
+A 2-layer theseus GPT trains fine on Tenstorrent via a plain-`jit` smoke harness,
+but the **real theseus trainer** (`gpt/train/pretrain`) aborts during compile with
+a hard C++ assertion — not a graceful legalization failure — deep in the Shardy
+dialect's reshard→collectives export pass:
 
 ```text
 python: .../shardy/dialect/sdy/transforms/export/reshard_to_collectives.cc:394:
@@ -14,7 +14,7 @@ python: .../shardy/dialect/sdy/transforms/export/reshard_to_collectives.cc:394:
 Signal: Aborted (6)
 ```
 
-The trigger is the trainer's **tensor-parallel sharding plan**: weight
+The trigger is the theseus trainer's **tensor-parallel sharding plan**: weight
 kernels are annotated `#sdy.sharding<@mesh, [{"shard"}, {}]>` (and the transpose
 `[{}, {"shard"}]`) on a `<["batch"=1, "shard"=1]>` mesh. Even with `shard=1` (a
 single device, no real parallelism) a matmul whose operands carry mismatched
@@ -37,8 +37,9 @@ the reshard at all for single-device runs.
   this aborts before any scatter is reached, and reproduces with no gather/scatter
   in the graph at all.
 - Impact: on-device *training numerics* work (see the scatter lesson — RoPE scatter
-  is bit-exact, a GPT trains via plain `jit`). What is blocked is any trainer that
-  applies a tensor-parallel sharding plan unconditionally (including `n_shards=1`).
+  is bit-exact, a GPT trains via plain `jit`). What is blocked is running the
+  **theseus trainer**, which applies a tensor-parallel sharding plan unconditionally
+  (including `n_shards=1`).
 - Scope of trigger: a non-trivial reshard on a size-1 named mesh axis. A *trivial*
   single-axis reshard (`P("x",None) → P(None,"x")` on `<"x"=1>`) is optimized away
   and does **not** abort; the matmul-driven transpose reshard on a 2-axis
@@ -54,28 +55,32 @@ the reshard at all for single-device runs.
 
 ## Host Environment
 
-- Tenstorrent Blackhole `p150b` (single chip, `TT_VISIBLE_DEVICES=2`), Python 3.12,
-  JAX/jaxlib 0.7.1, `ARCH_NAME=blackhole`.
+- Tenstorrent Blackhole `p150b` (single chip, `TT_VISIBLE_DEVICES=2` on `tt-qb2`),
+  Python 3.12, JAX/jaxlib 0.7.1, `ARCH_NAME=blackhole`.
 
 ## User-Visible Failure
 
-A tensor-parallel-annotated training step on TT core-dumps during the first
-compile:
+`theseus run gpt/train/pretrain` on TT core-dumps during the first compile:
+
+```bash
+ARCH_NAME=blackhole JAX_PLATFORMS=tt,cpu TT_VISIBLE_DEVICES=2 \
+  python -m theseus.cli run gpt/train/pretrain configs/scratch/synthetic_pretrain.yaml ~/theseus
+# ... Aborted (core dumped)
+```
 
 ```text
 python: .../sdy/transforms/export/reshard_to_collectives.cc:394:
   ... CollectiveInserter::insert(): Assertion `isDone()' failed.
-Signal: Aborted (6)
 ```
 
-It aborts identically with or without `CONVERT_SHLO_TO_SHARDY=1` — the sharding
-annotations route through Shardy regardless.
+It aborts identically with or without `CONVERT_SHLO_TO_SHARDY=1` — the trainer's
+sharding annotations route through Shardy regardless.
 
 ## Root Cause
 
-A tensor-parallel sharding plan is attached to the model. The dumped SHLO
-(`TTXLA_LOGGER_LEVEL=DEBUG`) shows a `<["batch"=1, "shard"=1]>` mesh with weight
-kernels sharded on the `"shard"` axis:
+JAX/Flax in the theseus trainer attaches a tensor-parallel sharding plan to the
+model. The dumped SHLO (`TTXLA_LOGGER_LEVEL=DEBUG`) shows a `<["batch"=1,
+"shard"=1]>` mesh with weight kernels sharded on the `"shard"` axis:
 
 ```text
 sdy.mesh @mesh = <["batch"=1, "shard"=1]>
@@ -101,18 +106,19 @@ Not fixed. Two directions:
    differing axes all have size 1 as a no-op (or complete its factor bookkeeping)
    so `isDone()` holds. This is in bundled Shardy
    (`reshard_to_collectives.cc`), so it needs a tt-mlir-toolchain rebuild.
-2. **Framework-side (workaround):** do not apply the tensor-parallel sharding plan
+2. **Theseus-side (workaround):** do not apply the tensor-parallel sharding plan
    when there is a single shard/device (`n_shards == 1`) — emit the graph without
    `"shard"`-axis annotations so no reshard is produced. This unblocks
    single-device TT training without touching the compiler.
 
-The standalone numerics path (plain `jit`, no sharding plan) already trains on
-device and is the current way to exercise TT training end-to-end.
+The standalone numerics path (plain `jit`, no sharding plan;
+`scripts/synthetic_train_smoke.py`) already trains on device and is the current
+sanctioned way to exercise TT training end-to-end.
 
 ## Minimal Reproducer
 
 [supplemental/repro_sdy_reshard.py](/home/houjun/lessons/2026-06-03-ttxla-shardy-reshard-collectives-assert/supplemental/repro_sdy_reshard.py)
-— standalone JAX, no model harness, no gather/scatter. It:
+— standalone JAX, no theseus, no gather/scatter. It:
 
 1. Builds a `<"batch"=1, "shard"=1>` mesh on one TT device.
 2. `jit`s a `w1 @ w2` where `w1` is constrained to `[{}, {"shard"}]` and `w2`/the
@@ -126,11 +132,9 @@ matmul-driven transpose reshard above to surface.
 
 ## Reproduction Steps
 
-From a venv that has the TT PJRT plugin installed:
-
 ```bash
-source .venv/bin/activate
-ARCH_NAME=blackhole JAX_PLATFORMS=tt,cpu TT_VISIBLE_DEVICES=2 CONVERT_SHLO_TO_SHARDY=1 \
+source /home/houjun/theseus/.venv/bin/activate
+ARCH_NAME=blackhole JAX_PLATFORMS=tt,cpu TT_VISIBLE_DEVICES=2 \
   python /home/houjun/lessons/2026-06-03-ttxla-shardy-reshard-collectives-assert/supplemental/repro_sdy_reshard.py
 ```
 
@@ -143,17 +147,14 @@ python: .../reshard_to_collectives.cc:394: ... CollectiveInserter::insert():
 Aborted (core dumped)
 ```
 
-The same assertion fires from both the standalone repro and the full
-tensor-parallel-annotated trainer, confirming the reduction.
+The same assertion fires from both the pure-JAX repro and the full theseus
+trainer, confirming the reduction.
 
 ## Notes
 
 - This is an *assertion abort*, so it appears even though `shard=1` makes the
   reshard semantically a no-op. A build with `NDEBUG` would likely skip the
-  assert, but the underlying reshard handling would still be wrong. (The repro's
-  `try/except` therefore cannot catch it on an assert build — the process aborts
-  with SIGABRT; `RESHARD_FAILED` is only reached on a build that returns a
-  recoverable error.)
+  assert, but the underlying reshard handling would still be wrong.
 - Single-device runs should not need Shardy collectives at all; the cheapest
-  unblock is the framework-side workaround (skip sharding when `n_shards==1`).
+  unblock is the theseus-side workaround (skip sharding when `n_shards==1`).
 - Same Shardy version ships for Wormhole and Blackhole; expect the same abort.
