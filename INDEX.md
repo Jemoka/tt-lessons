@@ -69,11 +69,11 @@ Same op, three distinct failures (not duplicates):
 ## Performance
 
 - [tt-perf-trace-blocked-int-typecast-host-roundtrip](2026-06-03-tt-perf-trace-blocked-int-typecast-host-roundtrip/README.md)
-  — GPT training step is dispatch-bound; the decisive MFU lever is legalizing the
-  **batched** CE gather-VJP scatter (drops the big-vocab one_hot). Related to the
-  training-bring-up scatter lesson (the batched extension of
-  [ttxla-scatter-not-legalized](2026-06-03-ttxla-scatter-not-legalized/README.md)).
-  Secondary: an si32→ui32 index typecast host round-trip that blocks `enable_trace`.
+  — GPT training step was dispatch-bound; the decisive MFU lever was legalizing the
+  **batched** CE gather-VJP scatter (drops the big-vocab one_hot). **Fixed** (single-dim
+  routing) → 5.2% → 33.8% MFU, 20% goal met. The batched extension of
+  [ttxla-scatter-not-legalized](2026-06-03-ttxla-scatter-not-legalized/README.md).
+  Secondary (moot for MFU): an si32→ui32 index typecast host round-trip that blocks `enable_trace`.
 
 ## Host upload / layout
 
