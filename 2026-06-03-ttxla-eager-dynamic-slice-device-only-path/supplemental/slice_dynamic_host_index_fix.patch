@@ -1,0 +1,54 @@
+--- a/runtime/lib/ttnn/operations/data_movement/slice.cpp
++++ b/runtime/lib/ttnn/operations/data_movement/slice.cpp
+@@ -8,6 +8,7 @@
+ #include "tt/runtime/detail/ttnn/utils.h"
+ 
+ #include "ttmlir/Target/TTNN/program_generated.h"
++#include "ttnn/operations/core/core.hpp"
+ #include "ttnn/operations/data_movement/slice/slice.hpp"
+ #include <cstdint>
+ 
+@@ runSliceDynamicOp
++// Read a small rank-1 index tensor (begins/ends of a dynamic slice) back to
++// host int32 values, handling int32/uint32 storage.
++static ::ttsl::SmallVector<int32_t>
++readIndexTensorToHost(const ::ttnn::Tensor &t) {
++  ::ttnn::Tensor host =
++      (t.storage_type() == ::ttnn::StorageType::DEVICE) ? ::ttnn::from_device(t)
++                                                        : t;
++  ::ttsl::SmallVector<int32_t> out;
++  if (host.dtype() == ::ttnn::DataType::UINT32) {
++    auto v = host.to_vector<uint32_t>();
++    out.assign(v.begin(), v.end());
++  } else {
++    auto v = host.to_vector<int32_t>();
++    out.assign(v.begin(), v.end());
++  }
++  return out;
++}
++
+ static void runSliceDynamicOp(const ::tt::target::ttnn::SliceOp *op,
+                               ProgramTensorPool &tensorPool) {
+   const ::ttnn::Tensor &in = tensorPool.getTTNNTensorAndValidate(op->in());
+   const ::ttnn::Tensor &begins = ...->begins();
+   const ::ttnn::Tensor &ends   = ...->ends();
+-  // OLD: tensor-args overload -> tt-metal "device-only tensor args" path ->
+-  //      TT_FATAL: slice_dim and num_devices must be provided ...
+-  ::ttnn::Tensor out = ::ttnn::slice(in, begins, ends, step, memoryConfig);
++  // Materialize the small begins/ends index tensors to host and use the
++  // static-index ttnn::slice overload (same as runSliceStaticOp), which takes
++  // the normal slice path instead of the device-only multi-shard path.
++  ::ttsl::SmallVector<int32_t> beginsHost = readIndexTensorToHost(begins);
++  ::ttsl::SmallVector<int32_t> endsHost   = readIndexTensorToHost(ends);
++  ::ttsl::SmallVector<int32_t> stepHost;
++  if (op->step() && op->step()->size() > 0)
++    stepHost.assign(op->step()->begin(), op->step()->end());
++  else
++    stepHost.assign(beginsHost.size(), 1);
++  ttsl::Span<const int32_t> beginsSpan(beginsHost.data(), beginsHost.size());
++  ttsl::Span<const int32_t> endsSpan(endsHost.data(), endsHost.size());
++  ttsl::Span<const int32_t> stepSpan(stepHost.data(), stepHost.size());
++  ::ttnn::Tensor out =
++      ::ttnn::slice(in, beginsSpan, endsSpan, stepSpan, memoryConfig);
+   tensorPool.insertTTNNTensorAndValidate(op->out(), out);
+ }
