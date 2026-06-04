@@ -153,6 +153,33 @@ it (see below). Candidate directions:
   would silently walk `getDpsInitOperand(0)` to the wrong operand and land on the
   clip-div `[100288,256]` output. Reproduce/confirm by dumping the train_step TTNN
   IR and tracing the failing reshape's input back through its DPS-init chain.
+- **CONVERGED root (helpers + CPU audit), and the recommended fix.** The reduce
+  lowering is clean at every documented stage, so the `[1]`-reshape is a *later*
+  rank-0/scalar materialization whose buffer/global_id binds to the reduce **input**
+  in-context:
+  - source SHLO: `[100288,256]` feeds `stablehlo.reduce`(add across [0,1]) → rank-0
+    `f32` (global_norm sum-of-squares) — **no reshape** (verified on CPU).
+  - StableHLO→TTIR: `StableHLOToTTIRReduceOpConversionPattern` →
+    `ttir.sum keep_dim=false` (`StableHLOToTTIRPatterns.cpp:299-313`) — no reshape.
+  - TTIR→TTNN: `ReductionOpConversionPattern` → `ttnn.sum` (`TTIRToTTNN.cpp:283-295`)
+    — no reshape. → the scalar→`[1]` reshape is introduced by a rank-0/scalar→1D
+    materialization step downstream, and helper#2's TTNN IR dump confirms **no
+    `[100288,256]→[1]` reshape exists; all 71 `[1]`-target reshapes have scalar
+    operands** — so at the IR level the reshape is correct; the **runtime gid 1260
+    binds the big buffer to that scalar reshape's slot** (a cache/global_id
+    mis-stamp specific to the in-context clip-apply graph; the plain reduce passes
+    standalone).
+  - **Recommended fix (helper#2's consumer shape-guard, implementable):** in
+    `createReshapeOp` (`TTNNToFlatbuffer.cpp:~2704`) — and the CpuOp/FuncCall input
+    loops — when the cached input `TensorRef`'s shape ≠ the op's operand
+    `RankedTensorType` shape, stamp a **fresh** correctly-shaped ref for that operand
+    instead of the polluted cache entry. Converts the silent mis-read into a correct
+    ref regardless of how the cache got polluted. (My per-step DPS type-guard is a
+    no-op here because the resolved value is already same-typed; the guard must
+    compare the *cached ref's* shape to the operand, not the walk's per-step types.)
+  **VALIDATION BLOCKED:** confirming the fix / grabbing the exact `RESHAPE_IRCHECK`
+  line needs a hardware run; tt-qb2 sshd was down (connection refused) at consolidation
+  time.
 - **Defensive runtime guard:** at `program_executor.cpp` bind/insert time, assert
   the bound tensor's logical shape matches the `TensorRef`'s expected shape — this
   converts the confusing downstream reshape FATAL into a clear "global_id N shape
