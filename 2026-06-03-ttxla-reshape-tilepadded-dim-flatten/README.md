@@ -111,7 +111,7 @@ standalone scripts are kept only to document the layout-dependence; all are NEGA
 
 - `supplemental/repro_rope_reshape_NEGATIVE.py` — bare gather-grad on `(8,128,4,64)`;
   TT grad runs (≈1.5e-2 bf16), no FATAL, at n_head 4 and 32.
-- `supplemental/repro_attn_rope_grad.py` — standalone causal-attention block (qkv →
+- `supplemental/repro_attn_rope_grad_NEGATIVE.py` — standalone causal-attention block (qkv →
   RoPE `rotate_half` take → attention → loss grad) at the triggering shapes (n_embd
   256, n_head 4, head_dim 64, seq 128, batch 8), f32. **HW-verified: TT grad OK at
   both n_head=4 and n_head=32 — does NOT reproduce** (its docstring's "expected
