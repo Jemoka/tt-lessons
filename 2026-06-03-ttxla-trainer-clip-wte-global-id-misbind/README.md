@@ -123,6 +123,15 @@ Not implemented. Candidate directions:
   chain that lands on the clip-div `[100288,256]` output, so its recorded
   `global_id` becomes 1260. Audit `getOperandThroughDPSOps` against the clip
   `div`/`where`/broadcast ops.
+  Mechanism detail (`getOperandThroughDPSOps`, `FuncOpToProgram.h`): it walks
+  `while (isa<DestinationStyleOpInterface>(op)) value = dps.getDpsInitOperand(0)->get()`
+  — i.e. follows the **DPS destination/init** operand up the chain, **asserting
+  `getNumResults()==1` and `getNumDpsInits()==1`** (asserts are compiled out in the
+  Release plugin). A DPS op in the clip graph that violates those assumptions (e.g.
+  the `where`/select used to apply the clip, or a `div` whose init it shares),
+  would silently walk `getDpsInitOperand(0)` to the wrong operand and land on the
+  clip-div `[100288,256]` output. Reproduce/confirm by dumping the train_step TTNN
+  IR and tracing the failing reshape's input back through its DPS-init chain.
 - **Defensive runtime guard:** at `program_executor.cpp` bind/insert time, assert
   the bound tensor's logical shape matches the `TensorRef`'s expected shape — this
   converts the confusing downstream reshape FATAL into a clear "global_id N shape
