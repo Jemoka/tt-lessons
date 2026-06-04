@@ -11,7 +11,7 @@
 Pushing on-device GPT training MFU on Blackhole. Headline result: a compute-dense step went from
 **5.2% MFU (one_hot CE, 90.3 ms/step) → 33.8% MFU (integer-label CE, 13.9 ms/step), 6.5× faster** —
 **exceeding the ~20% target** — and the real `gpt/train/pretrain` trains end-to-end on TT with the
-new loss while `qwen_parity.py` stays byte-identical (0.4292 / top5 5). The matmul engine was never
+new loss while Qwen2.5-0.5B inference stays byte-identical (0.4292 / top5 5). The matmul engine was never
 the bottleneck (110 TFLOP/s ≈ 63% of the bf16-HiFi4 peak; a clean matmul step already hit 35%); the
 sink was the memory-bound `one_hot[B,T,V]` + its gradient, used only because integer-label CE's
 gather-VJP scatter wasn't legalized on TT.
@@ -28,7 +28,7 @@ overhead-bound; both are documented below as ruled-out leads.
 - **★★ 20% MFU GOAL ACHIEVED (2026-06-04): one_hot 5.2% → integer-label 33.8% MFU (6.5× faster, 90.3→13.9 ms/step) on the compute-dense vocab-head step.** The +80ms one_hot tax is eliminated; the step recovers the clean-matmul ~35% ceiling. Real `gpt/train/pretrain` completes on TT with the integer-label loss; qwen byte-identical. Achieved via the CE fix below — NOT `enable_trace` (4.4× slower) or fp8 (irrelevant while overhead-bound).
 - **★ RESOLVED (2026-06-04): the dominant MFU lever — big-vocab CE — is FIXED on TT.** Integer-label cross-entropy now legalizes AND runs on Blackhole with a **bit-exact gradient** (`max|tt-cpu| = 6.119e-09`, identical to one_hot), and **Qwen2.5-0.5B inference stays byte-identical** (0.4292 / top5 5). The fix is NOT the multi-dim de-batch (that legalized but flatten-to-1D blew L1, 67MB > 1.5MB); it is simpler and scalable: **route a batched scatter with `scatter_dims_to_operand_dims.size()==1` to the existing single-dim element-wise path** (the batching/row dims are position-aligned `update_scatter_dims`, handled by `extractElementWiseScatterIndices`' remap) — no flatten, CBs sized per-row, fits L1. `checkBasicLegality` now allows batching dims for single-scatter-dim, and skips the `index_vector_dim==1` / `index.rank≤update.rank` single-dim checks when batched (the non-batched RoPE path is unchanged). One file: `StableHLOToTTIRPatterns.cpp`. The model-side switch (the loss's one_hot → integer-label) realizes the MFU win; `enable_trace` and the host round-trips below are moot for MFU.
 - **Bug type:** performance (training MFU) — a memory-bound op (big-vocab one_hot CE) dominating the step, plus a backend scatter-legalization gap that forced the one_hot workaround.
-- **Component (the fix):** tt-mlir `lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp` (`StableHLOToTTIRScatterOpConversionPattern` — batched single-scatter-dim → single-dim path) + theseus model `loss()` (one_hot → integer-label CE).
+- **Component (the fix):** tt-mlir `lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp` (`StableHLOToTTIRScatterOpConversionPattern` — batched single-scatter-dim → single-dim path) + the model's `loss()` (one_hot → integer-label CE).
 - **Fixed:** YES — backend + model fix landed and HW-verified (grad bit-exact, real trainer trains on TT, qwen byte-identical). 33.8% MFU achieved.
 - **Ruled-out leads (documented below, do not pursue for MFU):** `enable_trace` (made a compute-bound step 4.4× slower; also blocked by si32→ui32 index + RNG `fold_in` host round-trips in `TTNNDecomposeLayouts.cpp`); fp8/fidelity (only raises the matmul ceiling, which was never the bottleneck — matmul is a healthy 63% of peak).
 
