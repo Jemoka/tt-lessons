@@ -1,4 +1,4 @@
-# Standalone pure-JAX reproducer for the embedding-backward rank-4 / reduce
+# Theseus-free pure-JAX reproducer for the embedding-backward rank-4 / reduce
 # rank-mismatch bug on Tenstorrent.
 #
 # Structure mirrors optax.clip_by_global_norm over the wte gradient: gather

@@ -11,21 +11,19 @@ Root cause: tt-metal's `ttnn::embedding_bw` returns a **rank-4** tensor (e.g. `[
 - **Bug type:** runtime tensor/IR rank mismatch (silent wrong-result, then crash).
 - **Component:** tt-mlir TTNN runtime, `ttnn::embedding_bw` op wrapper.
 - **Fixed locally:** yes — `runtime/lib/ttnn/operations/embedding/embedding_backward.cpp` reshapes the output to the IR rank. Verified on hardware.
-- **Not resolved by this fix:** the full GPT trainer step now advances past the clip and global-norm and fails at the *next* gap — an eager `jax.lax.dynamic_slice` (`dynamic_slice_p`, JAX `slicing.py:1474`) → `XlaRuntimeError: INTERNAL: Error code 13`, fixed in [2026-06-03-ttxla-eager-dynamic-slice-device-only-path](/home/houjun/lessons/2026-06-03-ttxla-eager-dynamic-slice-device-only-path/README.md).
-- **Supersedes:** this is the real root cause behind [2026-06-03-ttxla-trainer-clip-wte-global-id-misbind](/home/houjun/lessons/2026-06-03-ttxla-trainer-clip-wte-global-id-misbind/README.md) (the earlier "global_id mis-stamp" theory, now retained only as a diagnostic trail).
-- **Related (same op):** [2026-06-03-ttxla-embedding-bw-tile-padding-grad](/home/houjun/lessons/2026-06-03-ttxla-embedding-bw-tile-padding-grad/README.md) — another `ttnn.embedding_bw` backward bug (tile-padding gradient leak); distinct failure, not a duplicate.
-- **Inference unaffected:** Qwen2.5-0.5B inference does not exercise `embedding_bw`; output is byte-identical before/after (max diff 0.4292, top5 5).
+- **Not resolved by this fix:** the full theseus `gpt/train/pretrain` step now advances past the clip and global-norm and fails at the *next* gap — an eager `jax.lax.dynamic_slice` (`dynamic_slice_p`, JAX `slicing.py:1474`) → `XlaRuntimeError: INTERNAL: Error code 13`. That is a separate bug.
+- **Inference unaffected:** `qwen_parity.py` does not exercise `embedding_bw`; output is byte-identical before/after (max diff 0.4292, top5 5).
 
 ## Repositories
 
 - `/home/houjun/tt-xla` — PJRT plugin. Worktree dirty. The plugin dynamically links `third_party/tt-mlir/install/lib/libTTMLIRRuntime.so` (verified via `ldd`), so a runtime-only rebuild is picked up without rebuilding the plugin.
 - `/home/houjun/tt-xla/third_party/tt-mlir/src/tt-mlir` — tt-mlir compiler + runtime. `TTMLIR_GIT_HASH=412daacc440f10bb98ccc685c311b01f1fadab70`. Worktree dirty (this fix + unrelated landed fixes).
-- Trainer: `gpt/train/pretrain` (synthetic-pretrain config). Not modified for this fix.
+- `/home/houjun/theseus` — training harness. The trainer config used: `configs/scratch/synthetic_pretrain.yaml`, `job=gpt/train/pretrain`. Not modified for this fix.
 
 ## Host Environment
 
-- 4× Blackhole p150b.
-- Linux x86-64; clang-20 toolchain.
+- Box: `tt-qb2.stanford.edu` (`tt-qb-ac-02`), 4× Blackhole p150b.
+- Linux x86-64; clang-20 toolchain at `/opt/ttmlir-toolchain`.
 - jax/jaxlib 0.7.1, optax, flax. `ARCH_NAME=blackhole`, `JAX_PLATFORMS=tt,cpu`.
 
 ## User-Visible Failure
@@ -74,7 +72,7 @@ The `FlatbufferObjectCache` / serializer were ruled out directly: 180 serialized
 
 ## Minimal Reproducer
 
-`/home/houjun/lessons/2026-06-03-ttxla-embedding-bw-reduce-rank-mismatch/supplemental/repro_reduce_embgrad.py` (standalone pure JAX):
+`/home/houjun/lessons/2026-06-03-ttxla-embedding-bw-reduce-rank-mismatch/supplemental/repro_reduce_embgrad.py` (pure JAX, theseus-free):
 
 1. `emb = ones([100288,256])`; `idx = arange(32)`.
 2. `fwd(e) = sum(e[idx]**2)` — gather (embedding fwd) then scalar loss.
@@ -86,16 +84,16 @@ The `FlatbufferObjectCache` / serializer were ruled out directly: 180 serialized
 
 ## Reproduction Steps
 
-From a venv that has the TT PJRT plugin installed:
-
 ```bash
-source .venv/bin/activate
-# standalone reduced repro (fails before fix, passes after):
+ssh houjun@tt-qb2.stanford.edu
+cd /home/houjun/theseus && source .venv/bin/activate
+# reduced repro (fails before fix, passes after):
 ARCH_NAME=blackhole JAX_PLATFORMS=tt,cpu TT_VISIBLE_DEVICES=0 \
   python /home/houjun/lessons/2026-06-03-ttxla-embedding-bw-reduce-rank-mismatch/supplemental/repro_reduce_embgrad.py
-# full trainer (clip present), for the end-to-end path:
+# full trainer (clip present):
 ARCH_NAME=blackhole JAX_PLATFORMS=tt,cpu TT_VISIBLE_DEVICES=0 \
-  <project-trainer> run gpt/train/pretrain <synthetic-pretrain-config> training.tokens=8000
+  python -u -m theseus.cli run gpt/train/pretrain \
+  configs/scratch/synthetic_pretrain.yaml ~/theseus training.tokens=8000
 ```
 
 Surgical rebuild of the runtime only (no superbuild): recompile `embedding_backward.cpp` with the command from `build/compile_commands.json`, `ar r` the object into `build/runtime/lib/ttnn/operations/libTTRuntimeTTNNOps.a`, relink `libTTMLIRRuntime.so`, and copy it to `third_party/tt-mlir/install/lib/`.
@@ -117,7 +115,7 @@ AFTER : 0 reshape FATALs; advances past clip/global-norm to the next gap:
         jax.lax.dynamic_slice -> XlaRuntimeError INTERNAL Error code 13   (separate bug)
 ```
 
-Inference regression check — Qwen2.5-0.5B parity, byte-identical:
+Inference regression check — `qwen_parity.py` default invocation, byte-identical:
 
 ```text
 max diff: 0.4292325973510742   top5 overlap: 5

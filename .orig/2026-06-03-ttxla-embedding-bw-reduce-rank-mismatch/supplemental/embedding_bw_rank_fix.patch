@@ -1,0 +1,39 @@
+--- a/runtime/lib/ttnn/operations/embedding/embedding_backward.cpp
++++ b/runtime/lib/ttnn/operations/embedding/embedding_backward.cpp
+@@ -9,7 +9,11 @@
+ #include "tt/runtime/detail/ttnn/operations/utils.h"
+ #include "tt/runtime/detail/ttnn/utils.h"
+ #include "ttmlir/Target/TTNN/program_generated.h"
++#include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
+ #include "ttnn/operations/embedding_backward/embedding_backward.hpp"
+ #include "ttnn/tensor/tensor.hpp"
++
++#include <cstdio>
++#include <vector>
+ 
+ namespace tt::runtime::ttnn::operations::embedding_backward {
+ void run(const ::tt::target::ttnn::EmbeddingBackwardOp *op,
+@@ -31,7 +35,23 @@
+   ::ttnn::Tensor out =
+       ::ttnn::embedding_bw(input, weight, inGrad, dtype, memoryConfig);
+ 
++  // tt-metal's embedding_bw returns a rank-4 tensor (e.g. [1,1,V,E]), but the
++  // compiler declares a rank-2 [V,E] result. The extra leading unit dims make the
++  // runtime tensor's rank disagree with the IR, which breaks downstream
++  // rank-sensitive ops: e.g. a reduce lowered with dim_arg=[0,1] (correct for the
++  // rank-2 IR type) then reduces only the leading unit dims of the rank-4 tensor
++  // and leaves [V,E] unreduced -> the "scalar" carries the full buffer (observed
++  // as optax global_norm over the wte grad -> binary broadcast reshape
++  // new_volume==old_volume abort). Reshape the output to the IR-declared logical
++  // shape so its rank matches the IR.
++  if (op->out() && op->out()->desc() && op->out()->desc()->shape()) {
++    const auto *fbShape = op->out()->desc()->shape();
++    if (static_cast<size_t>(out.logical_shape().rank()) != fbShape->size()) {
++      std::vector<int32_t> targetShape(fbShape->begin(), fbShape->end());
++      out = ::ttnn::reshape(out, targetShape);
++    }
++  }
++
+   tensorPool.insertTTNNTensorAndValidate(op->out(), out);
+ }
+ } // namespace tt::runtime::ttnn::operations::embedding_backward

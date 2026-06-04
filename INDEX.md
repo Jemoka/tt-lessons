@@ -6,8 +6,9 @@ closest relations are flagged below.
 
 ## On-device training bring-up (sequential gaps)
 
-Three distinct backend gaps surface in order while bringing up on-device training;
-each is exposed once the previous is cleared.
+Distinct backend gaps surface in order while bringing up on-device training; each
+is exposed once the previous is cleared. With the last fix the full
+`gpt/train/pretrain` trainer **completes end-to-end on Blackhole**.
 
 1. [ttxla-scatter-not-legalized](2026-06-03-ttxla-scatter-not-legalized/README.md)
    — non-axis-0 `stablehlo.scatter` (RoPE gather VJP) failed to legalize. **Fixed.**
@@ -17,10 +18,16 @@ each is exposed once the previous is cleared.
 3. [ttxla-reshape-tilepadded-dim-flatten](2026-06-03-ttxla-reshape-tilepadded-dim-flatten/README.md)
    — `ttnn.reshape` FATAL flattening a tile-padded `n_head` dim in the RoPE
    gather grad. **Fixed** (RowMajor reshape workaround).
-4. [ttxla-trainer-clip-wte-global-id-misbind](2026-06-03-ttxla-trainer-clip-wte-global-id-misbind/README.md)
-   — a scalar `ttnn.reshape` is runtime-bound to the wte tensor (`global_id 1260`)
-   in the `optax.clip_by_global_norm` graph. Open; whole-program (no standalone
-   repro).
+4. [ttxla-embedding-bw-reduce-rank-mismatch](2026-06-03-ttxla-embedding-bw-reduce-rank-mismatch/README.md)
+   — `ttnn.embedding_bw` returns rank-4 vs IR rank-2, so the `global_norm` reduce
+   leaves the full wte gradient in a scalar slot → reshape FATAL. **Fixed.** This
+   is the real root cause of the clip symptom below.
+   - [ttxla-trainer-clip-wte-global-id-misbind](2026-06-03-ttxla-trainer-clip-wte-global-id-misbind/README.md)
+     — the same FATAL diagnosed (incorrectly) as a serializer global-id mis-stamp;
+     **RESOLVED/superseded** by the rank-mismatch fix, retained as a diagnostic trail.
+5. [ttxla-eager-dynamic-slice-device-only-path](2026-06-03-ttxla-eager-dynamic-slice-device-only-path/README.md)
+   — eager `dynamic_slice` routes to tt-metal's device-only slice path and aborts
+   (checkpoint save). **Fixed** — trainer then completes end-to-end.
 
 ## Tile-padding in backward ops (same mechanism, different op)
 
@@ -34,12 +41,14 @@ A non-32-aligned dim padded to a 32×32 tile is mishandled in a backward op.
 
 ## Embedding op (forward vs backward)
 
-Same op, two distinct failures (not duplicates):
+Same op, three distinct failures (not duplicates):
 
 - [ttxla-fp32-embedding-bf16-cast](2026-06-03-ttxla-fp32-embedding-bf16-cast/README.md)
   — forward: fp32 weight cast to bf16 (op workaround).
 - [ttxla-embedding-bw-tile-padding-grad](2026-06-03-ttxla-embedding-bw-tile-padding-grad/README.md)
-  — backward: tile-padding gradient leak.
+  — backward (`embedding_bw`): tile-padding gradient leak.
+- [ttxla-embedding-bw-reduce-rank-mismatch](2026-06-03-ttxla-embedding-bw-reduce-rank-mismatch/README.md)
+  — backward (`embedding_bw`): rank-4 runtime output vs rank-2 IR breaks a downstream reduce.
 
 ## Numeric precision (bf16 / TF32 on the FPU and accumulators)
 

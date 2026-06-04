@@ -2,7 +2,7 @@
 
 ## Summary
 
-After the embedding-backward rank fix ([2026-06-03-ttxla-embedding-bw-reduce-rank-mismatch](/home/houjun/lessons/2026-06-03-ttxla-embedding-bw-reduce-rank-mismatch/README.md)), the `gpt/train/pretrain` trainer ran the on-device training step but aborted in **checkpoint save** — `int(self.key[0])`, indexing the on-device PRNG key — with `XlaRuntimeError: INTERNAL: Error code 13`. The underlying tt-metal abort was `TT_FATAL: slice_dim and num_devices must be provided for device-only tensor args slice`.
+After the embedding-backward rank fix, the theseus `gpt/train/pretrain` trainer ran the on-device training step but aborted in **checkpoint save** — `int(self.key[0])`, indexing the on-device PRNG key — with `XlaRuntimeError: INTERNAL: Error code 13`. The underlying tt-metal abort was `TT_FATAL: slice_dim and num_devices must be provided for device-only tensor args slice`.
 
 Root cause: JAX implements eager (non-jit) `slice_p` via `dynamic_slice_p` with the start index as a runtime scalar tensor; tt-mlir lowers `stablehlo.dynamic_slice` to `ttir.slice_dynamic`, whose runtime op calls the tt-metal **tensor-args** `ttnn::slice` overload. That overload takes tt-metal's "device-only tensor args" path (multi-device shard semantics) which requires `slice_dim`/`num_devices` and aborts when they are absent. The fix materializes the small begins/ends index tensors to host and calls the static-index `ttnn::slice` overload instead.
 
@@ -11,24 +11,24 @@ Root cause: JAX implements eager (non-jit) `slice_p` via `dynamic_slice_p` with 
 - **Bug type:** wrong runtime op-overload / dispatch path (hard abort).
 - **Component:** tt-mlir TTNN runtime, `ttir.slice_dynamic` op (`runtime/lib/ttnn/operations/data_movement/slice.cpp`).
 - **Fixed locally:** yes — runtime materializes dynamic-slice indices to host and uses the static-index `ttnn::slice` overload. Verified on hardware.
-- **Milestone:** with this fix the full `gpt/train/pretrain` trainer **completes end-to-end on Blackhole** ("Job 'gpt/train/pretrain' completed successfully"), after the prior six gaps (scatter, Shardy size-1, while/scan, loss-flatten, tile-padded reshape, embedding_bw rank) were cleared. This is the **final** gap in the on-device training bring-up sequence (scatter → Shardy → reshape → embedding_bw rank → dynamic_slice).
-- **Inference unaffected:** Qwen2.5-0.5B inference emits no `slice_dynamic` (RoPE uses static slices), so inference output is unchanged.
+- **Milestone:** with this fix the full theseus `gpt/train/pretrain` trainer **completes end-to-end on Blackhole** ("Job 'gpt/train/pretrain' completed successfully"), after the prior six gaps (scatter, Shardy size-1, while/scan, loss-flatten, tile-padded reshape, embedding_bw rank) were cleared.
+- **Inference unaffected:** `qwen_parity.py` emits no `slice_dynamic` (RoPE uses static slices), so inference output is unchanged.
 
 ## Repositories
 
 - `/home/houjun/tt-xla/third_party/tt-mlir/src/tt-mlir` — `TTMLIR_GIT_HASH=412daacc440f10bb98ccc685c311b01f1fadab70`, worktree dirty (this fix + earlier landed fixes). The PJRT plugin dynamically links `install/lib/libTTMLIRRuntime.so`, so a runtime-only rebuild suffices.
-- Trainer: `gpt/train/pretrain` (synthetic-pretrain config). Not modified for this fix.
+- `/home/houjun/theseus` — training harness; `gpt/train/pretrain`, `configs/scratch/synthetic_pretrain.yaml`. Not modified for this fix.
 
 ## Host Environment
 
-- 4× Blackhole p150b. clang-20 toolchain.
+- `tt-qb2.stanford.edu`, 4× Blackhole p150b. clang-20 toolchain at `/opt/ttmlir-toolchain`.
 - jax/jaxlib 0.7.1. `ARCH_NAME=blackhole`, `JAX_PLATFORMS=tt,cpu`.
 
 ## User-Visible Failure
 
 ```text
-File ".../training/base.py", line 868, in train -> self.save(...)
-File ".../job.py", line 232, in save_tree_and_metadata_from_path
+File ".../theseus/training/base.py", line 868, in train -> self.save(...)
+File ".../theseus/job.py", line 232, in save_tree_and_metadata_from_path
     "jax_random": int(self.key[0]),
 File ".../jax/_src/lax/slicing.py", line 1474, in _slice_impl
     return dispatch.apply_primitive(dynamic_slice_p, x, *start_indices, ...)
@@ -70,15 +70,15 @@ Under jit, `x[0]` instead folds to a static `stablehlo.slice`/`ttir.slice_static
 
 ## Reproduction Steps
 
-From a venv that has the TT PJRT plugin installed:
-
 ```bash
-source .venv/bin/activate
+ssh houjun@tt-qb2.stanford.edu
+cd /home/houjun/theseus && source .venv/bin/activate
 ARCH_NAME=blackhole JAX_PLATFORMS=tt,cpu TT_VISIBLE_DEVICES=0 \
   python /home/houjun/lessons/2026-06-03-ttxla-eager-dynamic-slice-device-only-path/supplemental/repro_eager_dynamic_slice.py
-# full trainer, for the end-to-end path:
+# full trainer:
 ARCH_NAME=blackhole JAX_PLATFORMS=tt,cpu TT_VISIBLE_DEVICES=0 \
-  <project-trainer> run gpt/train/pretrain <synthetic-pretrain-config> training.tokens=8000
+  python -u -m theseus.cli run gpt/train/pretrain \
+  configs/scratch/synthetic_pretrain.yaml ~/theseus training.tokens=8000
 ```
 
 Runtime-only surgical rebuild: recompile `slice.cpp` with the command from `build/compile_commands.json`, `ar r` the object into `build/runtime/lib/ttnn/operations/libTTRuntimeTTNNOps.a`, relink `libTTMLIRRuntime.so`, copy to `install/lib/`.
@@ -91,7 +91,7 @@ AFTER : [PASS] eager int(a[0]) = 0;  [PASS] key[0]/key[1:2]/big[0]/big[3:5] all 
 TRAINER: Job 'gpt/train/pretrain' completed successfully   (was: abort in checkpoint save)
 ```
 
-Qwen2.5-0.5B inference regression check (with the slice-fix runtime deployed) — byte-identical, no regression:
+`qwen_parity.py` regression check (default invocation, with the slice-fix runtime deployed) — byte-identical, no regression:
 
 ```text
 max diff: 0.4292325973510742   top5 overlap: 5
