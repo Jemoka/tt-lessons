@@ -9,9 +9,9 @@ Root cause: `TenstorrentUniformToRandConversionPattern` (the `tenstorrent.unifor
 ## Status
 
 - **Bug type:** compiler crash (MLIR assertion / abort) on a valid input dtype.
-- **Component:** tt-mlir, `lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp:261-262` (`TenstorrentUniformToRandConversionPattern`). These are the only two `getValues<float>()` calls in the entire `lib/Conversion/` tree, so this is the whole gap.
+- **Component:** tt-mlir, `lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp` (`TenstorrentUniformToRandConversionPattern`).
 - **Fixed locally:** yes — `getValues<float>()` → `getValues<APFloat>()` + `APFloat::convert(IEEEsingle)`. Verified on hardware: fully-bf16 GPT now compiles and runs (no abort).
-- **Inference unaffected / no regression:** Qwen2.5-0.5B inference byte-identical after the change (max diff 0.4292325973510742, top5 5).
+- **Inference unaffected / no regression:** `qwen_parity.py` byte-identical after the change (max diff 0.4292325973510742, top5 5).
 - **Separate remaining issue (NOT this bug):** with bf16 *params*, on-device training loss is `-inf` from step 0 — a **TT-specific numerical overflow** in the fully-bf16 forward pass (CPU fully-bf16 trains fine: 11.49→6.78). This is a distinct, deeper backend numerics bug, documented in Notes; this lesson only covers the compiler abort. Standard mixed precision (fp32 params + bf16 activations) is unaffected and is the recommended config anyway.
 
 ## Repositories
@@ -20,7 +20,7 @@ Root cause: `TenstorrentUniformToRandConversionPattern` (the `tenstorrent.unifor
 
 ## Host Environment
 
-- 4× Blackhole p150b. clang-20 toolchain. jax/jaxlib 0.7.1, flax, optax. `ARCH_NAME=blackhole`, `JAX_PLATFORMS=tt,cpu`.
+- `tt-qb2.stanford.edu`, 4× Blackhole p150b. clang-20 toolchain. jax/jaxlib 0.7.1, flax, optax. `ARCH_NAME=blackhole`, `JAX_PLATFORMS=tt,cpu`.
 
 ## User-Visible Failure
 
@@ -60,32 +60,24 @@ auto lowAttr  = rewriter.getF32FloatAttr(toF32(*lowValue.getValues<llvm::APFloat
 auto highAttr = rewriter.getF32FloatAttr(toF32(*highValue.getValues<llvm::APFloat>().begin()));
 ```
 
-This mirrors an `APFloat` idiom already used in the same library at
-`lib/Conversion/StableHLOToTTIR/StableHLOToTTIRPatterns.cpp:3858`
-(`getValues<APFloat>()[0].convertToDouble()`). One file. Patch:
-`/home/houjun/lessons/2026-06-03-ttxla-bf16-uniform-init-getvalues-float/supplemental/bf16_uniform_getvalues_fix.patch`.
+One file. Patch: `/home/houjun/lessons/2026-06-03-ttxla-bf16-uniform-init-getvalues-float/supplemental/bf16_uniform_getvalues_fix.patch`.
 
 ## Minimal Reproducer
 
-- [supplemental/repro_bf16_uniform.py](/home/houjun/lessons/2026-06-03-ttxla-bf16-uniform-init-getvalues-float/supplemental/repro_bf16_uniform.py)
-  — standalone JAX, no model harness. Compiles a bf16 `jax.random.uniform` (with
-  bf16 `minval`/`maxval`) on TT — the minimal `tenstorrent.uniform` with bf16
-  `low`/`high` constants. **Before fix:** compiler abort (`getValues<float>`
-  assertion); **after fix:** compiles + runs. An f32 uniform is the contrast (always
-  compiles). (Model+grad logic validated on CPU; HW trigger pending.)
-- [supplemental/repro_bf16_compile.py](/home/houjun/lessons/2026-06-03-ttxla-bf16-uniform-init-getvalues-float/supplemental/repro_bf16_compile.py)
-  — standalone bisection harness (bf16 matmul / const weight / bias / rmsnorm /
-  grad / embedding), all of which PASS — confirming the trigger is specifically the
-  bf16 *uniform initializer* constant, not bf16 compute in general.
+`/home/houjun/lessons/2026-06-03-ttxla-bf16-uniform-init-getvalues-float/supplemental/smoke_bf16.py` — real GPT, dtypes from env `SMOKE_PARAM`/`SMOKE_ACT`:
+
+1. `SMOKE_PARAM=bfloat16 SMOKE_ACT=bfloat16` → **before fix:** compiler abort; **after fix:** compiles + runs.
+2. `SMOKE_PARAM=float32 SMOKE_ACT=bfloat16` (mixed) → trains fine before and after.
+
+`supplemental/repro_bf16_compile.py` is the bisection harness (bf16 matmul / const weight / bias / rmsnorm / grad / embedding) — all of which PASS, confirming the trigger is specifically the bf16 *uniform initializer* constant, not bf16 compute in general.
 
 ## Reproduction Steps
 
-From a venv that has the TT PJRT plugin installed:
-
 ```bash
-source .venv/bin/activate
-ARCH_NAME=blackhole JAX_PLATFORMS=tt,cpu TT_VISIBLE_DEVICES=0 \
-  python /home/houjun/lessons/2026-06-03-ttxla-bf16-uniform-init-getvalues-float/supplemental/repro_bf16_uniform.py
+ssh houjun@tt-qb2.stanford.edu
+cd /home/houjun/theseus && source .venv/bin/activate
+SMOKE_PARAM=bfloat16 SMOKE_ACT=bfloat16 ARCH_NAME=blackhole JAX_PLATFORMS=tt,cpu TT_VISIBLE_DEVICES=0 \
+  python /home/houjun/lessons/2026-06-03-ttxla-bf16-uniform-init-getvalues-float/supplemental/smoke_bf16.py
 ```
 
 Compiler-only surgical rebuild: recompile `StableHLOLegalizeCompositePass.cpp` with the command from `build/compile_commands.json`, `ar r` into `build/lib/libTTMLIRStableHLOToTTIR.a`, relink `libTTMLIRCompiler.so`, copy to `install/lib/`.
@@ -96,14 +88,11 @@ Compiler-only surgical rebuild: recompile `StableHLOLegalizeCompositePass.cpp` w
 BEFORE: param=bf16 act=bf16 -> compiler Aborted (getValues<float> assertion)
 AFTER : param=bf16 act=bf16 -> compiles + runs (loss is -inf, see Notes — a separate bug)
         param=fp32 act=bf16  -> trains: loss 11.56 -> 6.98 (unchanged)
-Qwen2.5-0.5B inference: max diff 0.4292325973510742, top5 5  (byte-identical; no regression)
+qwen_parity (default): max diff 0.4292325973510742, top5 5  (byte-identical; no regression)
 ```
 
 ## Notes
 
-- This lesson consolidates an earlier duplicate that documented the same bug from
-  static analysis before the fix landed (`ttxla-uniform-rand-bf16-getvalues-float`,
-  now removed; original retained under `.orig/`).
 - **The `-inf` is a separate, still-open bug.** After this compiler fix, a fully-bf16 model compiles but its on-device training loss is `-inf` from step 0 — an overflow in the bf16 forward pass that is **TT-specific** (the identical fully-bf16 model trains fine on CPU: 11.49→6.78). Suspected: a bf16-accumulated reduction (unembed matmul over vocab=100288, or softmax/normalization) overflowing where fp32 accumulation would not. Candidate for the compute_config (HiFi4 + fp32_dest_acc) treatment on the remaining reduce/matmul ops, or a forward op keeping bf16 output where fp32 is needed. Left for a follow-up / delegation.
 - **Practical guidance:** train bf16 GPTs in the standard mixed-precision form (fp32 master params + bf16 activations) — it works on TT today and is best practice regardless. Fully-bf16 *params* is uncommon; this fix unblocks its *compilation*, and the `-inf` numerics remain to be chased.
 - The `APFloat::convert` approach is the general-correct way to read a float dense-attr element of unknown type; the same `getValues<float>()` anti-pattern elsewhere (e.g. composite clamp bounds) would have the same bf16 hazard.

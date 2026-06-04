@@ -24,15 +24,7 @@ constants stay f32.
 - Component: `tt-mlir`
   `lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp:261-262`
   (`TenstorrentUniformToRandConversionPattern`, `tenstorrent.uniform` → `ttir.rand`).
-- Fixed locally: **Yes — built, deployed, HW-verified.** The `getValues<APFloat>` +
-  `toF32()` fix is in `StableHLOLegalizeCompositePass.cpp:261-274`; `libTTMLIRCompiler.so`
-  (sha256 `febb7803…`) rebuilt + deployed to tt-qb2 and confirmed on chip 1: the fully-bf16
-  smoke now **compiles (rc=0), abort gone.** See Verification.
-- Follow-up (separate, NOT this bug): with compilation unblocked, fully-bf16-**param**
-  training produces **-inf loss on TT** while training fine on CPU (finite, decreasing) — a
-  TT-specific numerical issue (likely a bf16 RandOp/softmax overflow), exposed only now.
-  Low priority: mixed precision (fp32 params + bf16 acts) is best practice and trains
-  cleanly on TT, so the practical "bf16 GPT on TT" answer is yes via mixed precision.
+- Fixed locally: **No** — root-caused + exact fix identified (below); not yet built/verified.
 - Scope: only **fully-bf16-parameter** models (uncommon — fp32 master weights with
   bf16 activations is best practice and works). Mixed precision and qwen_parity are
   unaffected.
@@ -120,24 +112,9 @@ TT_VISIBLE_DEVICES=1 CONVERT_SHLO_TO_SHARDY=1 JAX_PLATFORMS=tt,cpu ARCH_NAME=bla
 
 ## Verification
 
-Before fix: fully-bf16 smoke aborts in lowering (assertion above).
-
-After fix (`libTTMLIRCompiler.so` sha256 `febb7803…`, deployed to tt-qb2, run on chip 1):
-
-```text
-fully-bf16 (param=bf16, act=bf16):
-  TT  -> COMPILES, rc=0, abort GONE (0 getValues/BuiltinAttributes/Aborted)   [FIX CONFIRMED]
-         but loss = -inf at every step (finite=False)                         [separate TT-specific issue]
-  CPU -> loss 11.49 -> 6.78 (finite, decreasing)                              [control: not inherent to bf16]
-mixed precision (param=f32, act=bf16):
-  CPU -> loss 11.68 -> 6.62 ;  TT -> loss 11.56 -> 6.98  (both train)         [recommended config, works on TT]
-```
-
-So the compiler fix is confirmed (the abort is cleared on real hardware). The residual
-fully-bf16-param **-inf loss is TT-specific** (CPU trains the identical config fine), a
-separate numerical bug — out of scope for this lesson and low priority, since mixed
-precision is the recommended and working path. -inf loss points at a log(0) in the
-CE/log_softmax, i.e. a bf16 logit/softmax overflow→inf on the TT path that CPU bf16 avoids.
+Before fix: fully-bf16 smoke aborts in lowering (assertion above). Mixed precision
+trains (loss 11.56 → 6.98). After the APFloat fix, the fully-bf16 smoke is expected to
+compile and train. (Verification on chip 1 pending the rebuilt `libTTMLIRCompiler.so`.)
 
 ## Notes
 

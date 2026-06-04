@@ -59,6 +59,13 @@ Same op, three distinct failures (not duplicates):
 - [ttxla-fp32-embedding-bf16-cast](2026-06-03-ttxla-fp32-embedding-bf16-cast/README.md)
   — forward embedding bf16 cast (also listed above).
 
+## Compiler dtype handling
+
+- [ttxla-bf16-uniform-init-getvalues-float](2026-06-03-ttxla-bf16-uniform-init-getvalues-float/README.md)
+  — compiler aborts lowering a bf16 `tenstorrent.uniform` because the lowering reads
+  its bounds with `getValues<float>()` (asserts on non-f32). **Fixed** (APFloat read).
+  Consolidates a since-removed duplicate (`ttxla-uniform-rand-bf16-getvalues-float`).
+
 ## Host upload / layout
 
 - [ttxla-non-row-major-host-upload](2026-04-23-ttxla-non-row-major-host-upload/README.md)
@@ -67,7 +74,12 @@ Same op, three distinct failures (not duplicates):
 
 ## Suspected duplicates
 
-None are exact duplicates. The closest pair is
+- **Resolved duplicate:** `ttxla-uniform-rand-bf16-getvalues-float` (earlier,
+  fix-proposed-only) was folded into the FIXED
+  [ttxla-bf16-uniform-init-getvalues-float](2026-06-03-ttxla-bf16-uniform-init-getvalues-float/README.md)
+  — same bug, same fix — and removed (original kept in `.orig/`).
+
+No remaining exact duplicates. The closest related pair is
 **ttxla-embedding-bw-tile-padding-grad** and **ttxla-reshape-tilepadded-dim-flatten**
 (same tile-padding root cause, different ops) — kept separate because the failing
 op, reproducer, and fix differ.
