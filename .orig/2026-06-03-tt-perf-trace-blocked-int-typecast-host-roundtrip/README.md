@@ -17,7 +17,7 @@ On-device GPT training on Blackhole runs at **~0.6% MFU** — the step is **~190
 ## Repositories
 
 - `/home/houjun/tt-xla/third_party/tt-mlir/src/tt-mlir` — `TTMLIR_GIT_HASH=412daacc…`, dirty.
-- 4× Blackhole p150b. jax/jaxlib 0.7.1. `ARCH_NAME=blackhole`, `JAX_PLATFORMS=tt,cpu`.
+- tt-qb2, 4× Blackhole p150b. jax/jaxlib 0.7.1. `ARCH_NAME=blackhole`, `JAX_PLATFORMS=tt,cpu`.
 
 ## User-Visible Failure
 
@@ -54,7 +54,7 @@ A uint32-index JAX workaround (feed ui32 token ids so no si32→ui32 cast is emi
 Later measurement overturned the trace hypothesis:
 - A **clean matmul-MLP training step** (24 layers, no embedding/index/RNG/vocab) **already hits 35.3% MFU** (61.8 TFLOP/s vs 175) — so matmul+dispatch is NOT the bottleneck and the 20% target is met on the matmul core.
 - **`enable_trace` made that step 4.4× SLOWER** (35%→8%) — trace hurts compute-bound steps. Do not pursue it for MFU.
-- The real GPT trainer is **0.6% MFU** because of GPT-specific overheads stacked around the matmuls. Dominant: the **one_hot cross-entropy over the big vocab** (+80 ms alone: 35%→5.2%), a memory-bound `one_hot[B,T,V]`+grad. It exists only as a workaround for integer-label CE, whose `take_along_axis` gather-VJP emits a `stablehlo.scatter` that fails to legalize (the batched extension of [2026-06-03-ttxla-scatter-not-legalized](/home/houjun/lessons/2026-06-03-ttxla-scatter-not-legalized/README.md)).
+- The real theseus GPT is **0.6% MFU** because of GPT-specific overheads stacked around the matmuls. Dominant: the **one_hot cross-entropy over the big vocab** (+80 ms alone: 35%→5.2%), a memory-bound `one_hot[B,T,V]`+grad. It exists only as a workaround for integer-label CE, whose `take_along_axis` gather-VJP emits a `stablehlo.scatter` that fails to legalize.
 
 **The lever = legalize the CE gather-VJP scatter so integer-label CE works (drops the one_hot).** This is a backend scatter-legalization extension, qwen-safe (inference has no training scatter). The si32→ui32 typecast + RNG host round-trips (below) are secondary (sync removal), and the trace-unblock they'd enable is moot since trace hurts.
 
@@ -78,7 +78,7 @@ stablehlo.scatter(operand[BT,V], indices, updates) {
 3. New dim numbers: `scatter_dims_to_operand_dims = [0,1]`, `inserted_window_dims = [0,1]`, `index_vector_dim = last`, **batching dims cleared**.
 4. Result satisfies the existing multi-dim checks (6118-6144: `index_vector_dim`=last ✓; `scatter_dims ⊇ inserted_window` {0,1}⊇{0,1} ✓) → `flattenMultiDimScatterIndices` + matchAndRewrite handle it unchanged.
 
-Implementation locus: `checkBasicLegality` (`:6093`, allow batching dims when de-batchable) + a preprocessing step in `matchAndRewrite` that builds `new_indices` (iota+concat) and the remapped dim numbers before the existing index flattening. Generalize to N batch dims by iota+concat per batch dim. **Verify:** grad bit-exact vs CPU (`repro_scatter_legalize.py` pattern) + a training smoke converges + Qwen2.5-0.5B inference byte-identical, before landing.
+Implementation locus: `checkBasicLegality` (`:6093`, allow batching dims when de-batchable) + a preprocessing step in `matchAndRewrite` that builds `new_indices` (iota+concat) and the remapped dim numbers before the existing index flattening. Generalize to N batch dims by iota+concat per batch dim. **Verify:** grad bit-exact vs CPU (`repro_scatter_legalize.py` pattern) + a training smoke converges + `qwen_parity.py` byte-identical, before landing.
 
 ## Fix (proposed, not yet landed) — secondary host round-trips
 
@@ -86,7 +86,7 @@ Lower the row-major device-input integer typecast **on-device** instead of via h
 
 Alternatives: (a) feed `uint32` token indices from the framework so no cast is needed (model-side, not always controllable); (b) make the embedding/gather lowering accept si32 indices directly.
 
-**Caveat:** `TTNNDecomposeLayouts` is central to every model; any change must be verified to keep Qwen2.5-0.5B inference byte-identical (max diff 0.4292325973510742, top5 5) and all training gaps green. That regression discipline is why this is staged rather than rushed.
+**Caveat:** `TTNNDecomposeLayouts` is central to every model; any change must be verified to keep `qwen_parity.py` byte-identical (max diff 0.4292325973510742, top5 5) and all training gaps green. That regression discipline is why this is staged rather than rushed.
 
 ## Reproduction Steps
 
@@ -114,5 +114,3 @@ enable_trace:            FAILS to compile (from_device on si32 index)  [the bloc
 - **MFU denominators (sourced):** bf16-HiFi4 = 175, bfp8-HiFi2 = 351, bfp4-LoFi = 702 TFLOP/s board peak (130 cores × {1.35, 2.7, 5.4}); ~83% achievable. The "664 BlockFP8" headline is the fp8/LoFi tier. 20% MFU vs bf16 peak = 35 TFLOP/s (reachable iff dispatch overhead is killed); vs 664 = 133 TFLOP/s (needs fp8 emission + matmul-bound).
 - **Timing methodology:** host wall-clock can't measure TT compute naively (≈0.13 ms dispatch floor; full readback is transfer-bound). Use a jitted unrolled dependency-chain + scalar hard-sync (`supplemental/roofline_amortized.py`); for a compute-dense full step, the step ≫ dispatch floor so plain `block_until_ready` timing is valid.
 - **Knob plumbing:** `enable_trace`, `experimental_weight_dtype` (bfp_bf8/bf4), `math_fidelity`, `ttnn_perf_metrics_enabled` are all JAX-settable PJRT compile options, but theseus calls bare `jax.jit`. A tt-xla env-var bridge (`TTXLA_COMPILE_OPTIONS="enable_trace=true,…"`, `compile_options.cc`) was added so the real trainer can set them with zero theseus edits.
-
-- **Implementation note (landing strategy):** the existing scatter helpers read `srcOp` directly, so land the de-batch as a *pre-normalization* — emit a new `stablehlo.scatter` with cleared batching dims + iota-concat-augmented indices + merged dim numbers, replace `srcOp` with it, and let the existing multi-dim path lower the new op (don't thread new dims through the helpers). agent3's full drop-in sketch (iota per batch dim, ordered concat, merged scatter/inserted dims, reduce=add, multi-update guard) is in talk.md.
