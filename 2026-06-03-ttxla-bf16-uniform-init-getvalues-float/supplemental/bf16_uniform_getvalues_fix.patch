@@ -1,0 +1,19 @@
+--- a/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp
++++ b/lib/Conversion/StableHLOToTTIR/StableHLOLegalizeCompositePass.cpp
+@@ TenstorrentUniformToRandConversionPattern::matchAndRewrite
+-    auto lowAttr = rewriter.getF32FloatAttr(lowValue.getValues<float>()[0]);
+-    auto highAttr = rewriter.getF32FloatAttr(highValue.getValues<float>()[0]);
++    // Read low/high as APFloat and convert to f32 — robust to the operand's
++    // float type. getValues<float>() asserts when the dense attr element type is
++    // not f32 (e.g. bf16, which a bfloat16-param model's uniform initializer
++    // emits), so it cannot be used directly here.
++    auto toF32 = [](llvm::APFloat v) -> float {
++      bool losesInfo = false;
++      v.convert(llvm::APFloat::IEEEsingle(),
++                llvm::APFloat::rmNearestTiesToEven, &losesInfo);
++      return v.convertToFloat();
++    };
++    auto lowAttr = rewriter.getF32FloatAttr(
++        toF32(*lowValue.getValues<llvm::APFloat>().begin()));
++    auto highAttr = rewriter.getF32FloatAttr(
++        toF32(*highValue.getValues<llvm::APFloat>().begin()));
