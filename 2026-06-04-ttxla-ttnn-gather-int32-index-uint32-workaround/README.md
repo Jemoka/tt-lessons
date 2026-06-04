@@ -19,8 +19,8 @@ TTNN-workarounds pass auto-insert the cast, exactly as embedding and `update_cac
 
 - **Bug type:** missing backend op-legalization workaround (operand dtype), not a miscompile.
 - **Component:** tt-mlir, `TTNNWorkarounds` pass + `TTNN_GatherOp` definition (TTNN dialect).
-- **Fixed locally:** yes — `libTTMLIRCompiler.so` rebuilt and deployed to the local install tree and
-  the install tree (`third_party/tt-mlir/install/lib/libTTMLIRCompiler.so`).
+- **Fixed locally:** yes — `libTTMLIRCompiler.so` rebuilt and deployed to the install tree
+  (`third_party/tt-mlir/install/lib/libTTMLIRCompiler.so`).
 - **General:** fixes any JAX program whose `gather`/`take_along_axis` produces an int32 index, not
   just the trainer that surfaced it.
 - **qwen-safe:** the workaround only rewrites a `ttnn.gather` operand dtype; Qwen2.5-0.5B inference
