@@ -1,0 +1,193 @@
+  LogicalResult
+  matchAndRewrite(mlir::stablehlo::ScatterOp srcOp,
+                  mlir::stablehlo::ScatterOp::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+
+    // De-batch: rewrite a batched stablehlo.scatter into an equivalent
+    // non-batched multi-dimensional scatter by turning each batching dim into an
+    // explicit index column (iota over the batch axis, concatenated into
+    // scatter_indices), then lower that form INLINE below (the new op is not
+    // re-visited by the conversion driver, so we must continue with it here).
+    // Required to legalize the integer-label cross-entropy gather-VJP (avoids the
+    // big [B,T,V] one_hot workaround — a major training-MFU win). See lesson
+    // 2026-06-03-tt-perf-trace-blocked-int-typecast-host-roundtrip.
+    mlir::stablehlo::ScatterOp op = maybeDeBatchScatter(srcOp, rewriter);
+
+    if (LogicalResult result = checkBasicLegality(op, rewriter);
+        !result.succeeded()) {
+      return result;
+    }
+
+    // Convert reduceType stablehlo attribute into ttir attribute.
+    llvm::ErrorOr<ttcore::ReduceType> scatterReduceType = getReduceType(op);
+    if (!scatterReduceType) {
+      return rewriter.notifyMatchFailure(
+          op, "ScatterOp cannot specify reduce type.");
+    }
+
+    Value inputTensor = op.getInputs()[0];
+    Value updateTensor = op.getUpdates()[0];
+    auto scatterDimsToOperandDims =
+        op.getScatterDimensionNumbers().getScatterDimsToOperandDims();
+    RankedTensorType inputType =
+        mlir::cast<RankedTensorType>(inputTensor.getType());
+    ArrayRef<int64_t> inputShape = inputType.getShape();
+    RankedTensorType outputType = mlir::cast<RankedTensorType>(
+        this->getTypeConverter()->convertType(op.getResults()[0].getType()));
+    RankedTensorType updateType =
+        mlir::cast<RankedTensorType>(updateTensor.getType());
+    ArrayRef<int64_t> updateShape = updateType.getShape();
+
+    // Single-dimensional scatter.
+    if (scatterDimsToOperandDims.size() == 1) {
+      // Process indices to match update tensor shape.
+      int32_t dim = scatterDimsToOperandDims[0];
+      Value finalIndexTensor = extractElementWiseScatterIndices(op, rewriter);
+
+      // Create ScatterOp.
+      rewriter.replaceOpWithNewOp<ttir::ScatterOp>(
+          op, outputType, inputTensor, finalIndexTensor, updateTensor,
+          rewriter.getI32IntegerAttr(dim),
+          ttcore::ReduceTypeAttr::get(rewriter.getContext(),
+                                      *scatterReduceType));
+      return success();
+    }
+
+    // Multi-dimensional scatter.
+    if (scatterDimsToOperandDims.size() > 1) {
+      // Always scatter along dimension 0 for flattened tensors.
+      constexpr int32_t SCATTER_DIMENSION = 0;
+
+      // Scatter indices, input, and update tensors flattened to 1D.
+      Value flattenedIndices =
+          flattenMultiDimScatterIndices(op, inputShape, updateShape, rewriter);
+      Value flattenedInput = ttir::utils::flattenTensor(
+          rewriter, op.getLoc(), inputTensor, "_input_flatten");
+      Value flattenedUpdate = ttir::utils::flattenTensor(
+          rewriter, op.getLoc(), updateTensor, "_update_flatten");
+
+      // Scatter scalars on flattened tensors.
+      Value scatterResult = rewriter.create<ttir::ScatterOp>(
+          op.getLoc(),
+          mlir::cast<RankedTensorType>(flattenedInput.getType()),
+          flattenedInput, flattenedIndices, flattenedUpdate,
+          rewriter.getI32IntegerAttr(SCATTER_DIMENSION),
+          ttcore::ReduceTypeAttr::get(rewriter.getContext(),
+                                      *scatterReduceType));
+
+      // Reshape result back to original input shape.
+      Value reshapedResult =
+          ttir::utils::createReshapeOp(rewriter,
+                                       ttmlir::utils::appendLocationSuffix(
+                                           op.getLoc(), "_result_reshape"),
+                                       scatterResult, inputShape);
+
+      rewriter.replaceOp(op, reshapedResult);
+      return success();
+    }
+
+    return failure();
+  }
+
+private:
+  // Normalize a batched stablehlo.scatter into an equivalent non-batched
+  // multi-dimensional scatter, by materializing each batching dim as an explicit
+  // index column (iota over the batch axis) concatenated into scatter_indices.
+  // Replaces srcOp with the new batching-free scatter and returns it so the
+  // caller lowers it INLINE (the conversion driver does not re-visit ops created
+  // mid-pattern). Returns srcOp unchanged when there are no batching dims or the
+  // batched shape is outside the handled case (then checkBasicLegality's batched
+  // reject fires — no miscompute). Only handles the case where every batch
+  // operand-dim is strictly below every scatter operand-dim (no interleaving)
+  // with an explicit index vector — exactly the integer-label CE gather-VJP.
+  mlir::stablehlo::ScatterOp
+  maybeDeBatchScatter(mlir::stablehlo::ScatterOp op,
+                      ConversionPatternRewriter &rewriter) const {
+    auto dn = op.getScatterDimensionNumbers();
+    ArrayRef<int64_t> inBatch = dn.getInputBatchingDims();
+    ArrayRef<int64_t> idxBatch = dn.getScatterIndicesBatchingDims();
+    if (inBatch.empty() && idxBatch.empty()) {
+      return op; // not batched; use the normal path
+    }
+    if (inBatch.size() != idxBatch.size() || !llvm::is_sorted(inBatch)) {
+      return op;
+    }
+
+    ArrayRef<int64_t> scatterDims = dn.getScatterDimsToOperandDims();
+    ArrayRef<int64_t> insertedWindow = dn.getInsertedWindowDims();
+    ArrayRef<int64_t> updateWindow = dn.getUpdateWindowDims();
+    int64_t ivd = dn.getIndexVectorDim();
+
+    Value indices = op.getScatterIndices();
+    auto idxType = mlir::cast<RankedTensorType>(indices.getType());
+    ArrayRef<int64_t> idxShape = idxType.getShape();
+    int64_t idxRank = idxShape.size();
+    Type elemTy = idxType.getElementType();
+
+    // Only the explicit-index-vector case (CE: indices [..,1], index_vector_dim
+    // < rank). Implicit trailing vector would need a reshape; fall through.
+    if (ivd >= idxRank) {
+      return op;
+    }
+    // No-interleave guard: every batch operand-dim strictly below every scatter
+    // operand-dim, so the merged index vector is [batch-iotas..., orig-vector].
+    int64_t maxBatch = -1;
+    for (int64_t d : inBatch) {
+      maxBatch = std::max(maxBatch, d);
+    }
+    for (int64_t d : scatterDims) {
+      if (d <= maxBatch) {
+        return op;
+      }
+    }
+
+    Location loc = op.getLoc();
+    // Each component (iota / original) shares the indices shape with the vector
+    // axis sized 1; the iota for batch dim i counts along scatter-indices axis
+    // idxBatch[i].
+    SmallVector<int64_t> compShape(idxShape.begin(), idxShape.end());
+    compShape[ivd] = 1;
+
+    SmallVector<Value> parts;
+    for (size_t i = 0; i < inBatch.size(); ++i) {
+      auto iotaType = RankedTensorType::get(compShape, elemTy);
+      parts.push_back(rewriter.create<mlir::stablehlo::IotaOp>(
+          loc, iotaType, static_cast<uint64_t>(idxBatch[i])));
+    }
+    parts.push_back(indices);
+
+    int64_t numComp =
+        static_cast<int64_t>(inBatch.size()) + idxShape[ivd];
+    SmallVector<int64_t> newIdxShape(idxShape.begin(), idxShape.end());
+    newIdxShape[ivd] = numComp;
+    auto newIdxType = RankedTensorType::get(newIdxShape, elemTy);
+    Value newIndices = rewriter.create<mlir::stablehlo::ConcatenateOp>(
+        loc, newIdxType, parts, static_cast<uint64_t>(ivd));
+
+    // Merged scatter/inserted dims = sorted(original ∪ batch).
+    SmallVector<int64_t> newScatterDims(inBatch.begin(), inBatch.end());
+    newScatterDims.append(scatterDims.begin(), scatterDims.end());
+    llvm::sort(newScatterDims);
+    SmallVector<int64_t> newInserted(insertedWindow.begin(),
+                                     insertedWindow.end());
+    newInserted.append(inBatch.begin(), inBatch.end());
+    llvm::sort(newInserted);
+
+    auto newDn = mlir::stablehlo::ScatterDimensionNumbersAttr::get(
+        op.getContext(), updateWindow, newInserted,
+        /*inputBatchingDims=*/{}, /*scatterIndicesBatchingDims=*/{},
+        newScatterDims, ivd);
+
+    auto newScatter = rewriter.create<mlir::stablehlo::ScatterOp>(
+        loc, op.getResultTypes(), op.getInputs(), newIndices, op.getUpdates(),
+        newDn, op.getIndicesAreSorted(), op.getUniqueIndices());
+    rewriter.inlineRegionBefore(op.getUpdateComputation(),
+                                newScatter.getUpdateComputation(),
+                                newScatter.getUpdateComputation().end());
+    rewriter.replaceOp(op, newScatter.getResults());
+    return newScatter;
+  }
+
+  LogicalResult checkBasicLegality(mlir::stablehlo::ScatterOp op,
+                                   ConversionPatternRewriter &rewriter) const {
+    auto inputBatchingDims =

@@ -80,6 +80,33 @@ stablehlo.scatter(operand[BT,V], indices, updates) {
 
 Implementation locus: `checkBasicLegality` (`:6093`, allow batching dims when de-batchable) + a preprocessing step in `matchAndRewrite` that builds `new_indices` (iota+concat) and the remapped dim numbers before the existing index flattening. Generalize to N batch dims by iota+concat per batch dim. **Verify:** grad bit-exact vs CPU (`repro_scatter_legalize.py` pattern) + a training smoke converges + Qwen2.5-0.5B inference byte-identical, before landing.
 
+### IMPLEMENTED + HW-VERIFIED: de-batch legalizes the CE scatter (qwen-safe); next layer is an L1 overflow
+
+The de-batch normalization is implemented in `StableHLOToTTIRScatterOpConversionPattern`
+(`maybeDeBatchScatter` + inline lowering; impl snapshot in
+`supplemental/debatch_scatter_impl.cpp.txt`). Key mechanics learned:
+- The new (de-batched) `stablehlo.scatter` is **not re-visited** by the dialect-conversion driver,
+  so it must be lowered **inline in the same `matchAndRewrite`** (return the new op from the
+  de-batch helper and continue with it; `checkBasicLegality` switched from `adaptor` to `op`).
+  Relying on re-matching silently leaves the new scatter unlowered (`failed to legalize`).
+- `ScatterDimensionNumbersAttr::get(ctx, updateWindowDims, insertedWindowDims, inputBatchingDims,
+  scatterIndicesBatchingDims, scatterDimsToOperandDims, indexVectorDim)`; iota/concat via
+  `rewriter.create`; region moved with `inlineRegionBefore`.
+
+**Verified on Blackhole (chip 2):**
+- The batched integer-label CE scatter **now legalizes** (SHLO→TTIR→TTNN succeeds; the prior
+  `failed to legalize 'stablehlo.scatter'` is gone). The IR blocker — the lever everyone identified
+  — is solved.
+- **qwen_parity byte-identical** with the de-batch compiler (max diff 0.4292325973510742, top5 5) —
+  the change only affects scatters with batching dims; inference has none. No regression.
+
+**Next layer (downstream, separate):** the de-batched scatter then hits a tt-metal **L1 overflow at
+runtime** — the multi-dim scatter lowering flattens the operand to 1D ([512,8192]→4.19M) and the
+ttnn scatter's circular buffers `grow to 67285840 B > max L1 1572864 B`. So legalization is correct
+but the existing flatten-to-1D multi-dim scatter lowering doesn't scale to large operands. Fixing
+that (DRAM/streamed memory config, or a non-flattening scatter lowering) is the next bounded step to
+realize the MFU win. Grad-bit-exactness gate `supplemental/ce_gradcheck2.py` is staged.
+
 ## Fix (proposed, not yet landed) — secondary host round-trips
 
 Lower the row-major device-input integer typecast **on-device** instead of via host: `to_layout(tilize) → ttnn.typecast(si32→ui32) → to_layout(untilize)`, all in device memory. Since si32/ui32 are device-tilizable, this is valid and removes the `from_device`, unblocking trace and removing a per-step sync. Locus: the device-input typecast handler in `TTNNDecomposeLayouts.cpp` (the `!output.isTilized()` / row-major typecast branch that currently bounces through host).
