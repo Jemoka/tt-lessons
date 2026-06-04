@@ -177,9 +177,21 @@ it (see below). Candidate directions:
     ref regardless of how the cache got polluted. (My per-step DPS type-guard is a
     no-op here because the resolved value is already same-typed; the guard must
     compare the *cached ref's* shape to the operand, not the walk's per-step types.)
+  **Likely mechanism (why two different Values share gid 1260 type-invisibly):**
+  the cache keys on `obj.getAsOpaquePointer()`, and MLIR **reuses freed Value/Op
+  addresses**. If the clip-div `[100288,256]` Value is erased during a rewrite and
+  its address is reused for the scalar reshape-input Value, `cache.at(scalar)`
+  returns the **stale clip-div entry** (gid 1260) — a classic opaque-pointer-reuse
+  cache bug, type-invisible, and in-context-only (the clip-apply graph has the
+  erase/realloc pattern; standalone reduce/clip don't). This is consistent with all
+  observations: IR operand is scalar, gid stamped to 1260, single write, no type
+  change in the DPS walk. The consumer shape-guard above defends against it; a deeper
+  fix would invalidate cache entries on Value erasure (or key on something stable
+  across rewrites).
   **VALIDATION BLOCKED:** confirming the fix / grabbing the exact `RESHAPE_IRCHECK`
   line needs a hardware run; tt-qb2 sshd was down (connection refused) at consolidation
-  time.
+  time. Helper#2's 5-min cron has the `RESHAPE_IRCHECK` capture queued to auto-fire on
+  sshd recovery.
 - **Defensive runtime guard:** at `program_executor.cpp` bind/insert time, assert
   the bound tensor's logical shape matches the `TensorRef`'s expected shape — this
   converts the confusing downstream reshape FATAL into a clear "global_id N shape
