@@ -91,7 +91,12 @@ AFTER : [PASS] eager int(a[0]) = 0;  [PASS] key[0]/key[1:2]/big[0]/big[3:5] all 
 TRAINER: Job 'gpt/train/pretrain' completed successfully   (was: abort in checkpoint save)
 ```
 
-`qwen_parity.py` regression check: inference emits no `slice_dynamic`, so output is unchanged (byte-identical baseline max diff 0.4292325973510742, top5 5). [Re-run pending an sshd window; the change touches only the `slice_dynamic` runtime path which inference does not exercise.]
+`qwen_parity.py` regression check (default invocation, with the slice-fix runtime deployed) — byte-identical, no regression:
+
+```text
+max diff: 0.4292325973510742   top5 overlap: 5
+hf loss: 5.514760494232178     jax loss: 5.533915201822917
+```
 
 ## Notes
 
