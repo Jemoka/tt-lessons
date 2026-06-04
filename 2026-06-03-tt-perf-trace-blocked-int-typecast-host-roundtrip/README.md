@@ -49,7 +49,22 @@ Note: both `Int32` and `UInt32` **are** tilize/untilize-able on device (`canTili
 
 A uint32-index JAX workaround (feed ui32 token ids so no si32→ui32 cast is emitted) does **not** unblock trace — it fails in a *different* spot: `jax._src.prng threefry_fold_in` / `random_fold_in` (the model's PRNG key path) → `XlaRuntimeError 13` under `enable_trace`. So the step has **≥2 mid-graph host round-trips** trace can't capture: (1) the si32→ui32 index typecast (below), and (2) the RNG fold_in path. Both are backend/compiler fixes; trace-on MFU is not measurable from JAX until both keep their tensors on-device. (This means a model-side dtype tweak alone cannot unblock trace.)
 
-## Fix (proposed, not yet landed)
+## CORRECTION (decisive): `enable_trace` is a DEAD END; the real lever is the big-vocab CE
+
+Later measurement overturned the trace hypothesis:
+- A **clean matmul-MLP training step** (24 layers, no embedding/index/RNG/vocab) **already hits 35.3% MFU** (61.8 TFLOP/s vs 175) — so matmul+dispatch is NOT the bottleneck and the 20% target is met on the matmul core.
+- **`enable_trace` made that step 4.4× SLOWER** (35%→8%) — trace hurts compute-bound steps. Do not pursue it for MFU.
+- The real theseus GPT is **0.6% MFU** because of GPT-specific overheads stacked around the matmuls. Dominant: the **one_hot cross-entropy over the big vocab** (+80 ms alone: 35%→5.2%), a memory-bound `one_hot[B,T,V]`+grad. It exists only as a workaround for integer-label CE, whose `take_along_axis` gather-VJP emits a `stablehlo.scatter` that fails to legalize.
+
+**The lever = legalize the CE gather-VJP scatter so integer-label CE works (drops the one_hot).** This is a backend scatter-legalization extension, qwen-safe (inference has no training scatter). The si32→ui32 typecast + RNG host round-trips (below) are secondary (sync removal), and the trace-unblock they'd enable is moot since trace hurts.
+
+### The CE scatter is a BATCHED scatter; model-side flatten does NOT avoid it (HW-verified)
+The integer-label CE gradient emits `stablehlo.scatter` with **batching dims** (`input_batching_dims=[0]`, `scatter_indices_batching_dims=[0]`, `index_vector_dim=2`, `inserted_window_dims=[1]`, `update_window_dims=[0]`), rejected at `StableHLOToTTIRPatterns.cpp:6093` (`checkBasicLegality`, first check). Reshaping `logits [B,T,V]→[B*T,V]` + `take_along_axis` (route 1) was tested on HW and **still emits a batched scatter** (batch over the BT rows) → same `failed to legalize 'stablehlo.scatter'`. So there is **no pure model-side escape**; the backend must handle the batched scatter.
+
+### Fix (scoped): de-batch the scatter in the conversion pattern
+In `StableHLOToTTIRScatterOpConversionPattern` (`StableHLOToTTIRPatterns.cpp:6086`): when batching dims are present, **rewrite them to explicit indices** — iota over each batch dim, concat into `scatter_indices` along `index_vector_dim`, move the batch dims from `input_batching_dims` into `scatter_dims_to_operand_dims`, and clear the batching dims. This reduces the batched CE scatter to the **multi-dimensional** scatter form the pattern already supports (:6118-6144, requires `index_vector_dim`=last and `scatter_dims ⊇ inserted_window`). Then `extractElementWiseScatterIndices`/matchAndRewrite build the flat index against the de-batched multi-dim shape. **qwen-safe** (no inference scatter); **training-correctness-critical** — must verify the loss gradient is bit-exact (existing `repro_scatter_legalize.py` pattern) + a training smoke converges, before landing. This is the precise, bounded next backend task and the highest-value MFU lever.
+
+## Fix (proposed, not yet landed) — secondary host round-trips
 
 Lower the row-major device-input integer typecast **on-device** instead of via host: `to_layout(tilize) → ttnn.typecast(si32→ui32) → to_layout(untilize)`, all in device memory. Since si32/ui32 are device-tilizable, this is valid and removes the `from_device`, unblocking trace and removing a per-step sync. Locus: the device-input typecast handler in `TTNNDecomposeLayouts.cpp` (the `!output.isTilized()` / row-major typecast branch that currently bounces through host).
 
