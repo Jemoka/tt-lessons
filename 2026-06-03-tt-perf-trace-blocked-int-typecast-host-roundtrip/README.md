@@ -45,6 +45,10 @@ error: 'ttnn.capture_or_execute_trace' op All output tensors of trace function m
 
 Note: both `Int32` and `UInt32` **are** tilize/untilize-able on device (`canTilizeDataTypeOnDevice`/`canUntilizeDataTypeOnDevice`, lines 151-168), so an on-device path is feasible — the pass simply doesn't choose it for the row-major device-input typecast case.
 
+## Second trace blocker (confirmed): RNG `threefry_fold_in` host path
+
+A uint32-index JAX workaround (feed ui32 token ids so no si32→ui32 cast is emitted) does **not** unblock trace — it fails in a *different* spot: `jax._src.prng threefry_fold_in` / `random_fold_in` (the model's PRNG key path) → `XlaRuntimeError 13` under `enable_trace`. So the step has **≥2 mid-graph host round-trips** trace can't capture: (1) the si32→ui32 index typecast (below), and (2) the RNG fold_in path. Both are backend/compiler fixes; trace-on MFU is not measurable from JAX until both keep their tensors on-device. (This means a model-side dtype tweak alone cannot unblock trace.)
+
 ## Fix (proposed, not yet landed)
 
 Lower the row-major device-input integer typecast **on-device** instead of via host: `to_layout(tilize) → ttnn.typecast(si32→ui32) → to_layout(untilize)`, all in device memory. Since si32/ui32 are device-tilizable, this is valid and removes the `from_device`, unblocking trace and removing a per-step sync. Locus: the device-input typecast handler in `TTNNDecomposeLayouts.cpp` (the `!output.isTilized()` / row-major typecast branch that currently bounces through host).
