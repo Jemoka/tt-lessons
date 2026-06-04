@@ -1,6 +1,6 @@
 # TT Perf: Real GPT Training is Dispatch-Bound (~0.6% MFU) — Limitation Analysis + a Partial CE Fix
 
-> **NOT a full win — read the corrected Status.** The real `theseus gpt/train/pretrain` step on
+> **NOT a full win — read the corrected Status.** The real `gpt/train/pretrain` trainer step on
 > Blackhole is **~0.6% MFU (dispatch-bound)**, not ~20%. An earlier "33.8% / GOAL ACHIEVED" claim
 > was from a **standalone matmul microbench**, not the real trainer — corrected below. The
 > integer-label CE fix is a real but partial + shape-fragile improvement (removes one of several
@@ -29,10 +29,10 @@ dead ends for MFU.
 ## Status
 
 - **⚠️ CORRECTED (2026-06-04): ~20% MFU is NOT achieved on the real trainer.** Honest measured state:
-  - **The real `theseus gpt/train/pretrain` step is ~0.6% MFU** (measured: d=1536/L=12/seq=512/vocab=32000, slow-safe ON, one_hot CE → 9687 ms/step, 1.0 TFLOP/s). It trains correctly but is **dispatch-bound**, not compute-bound.
+  - **The real `gpt/train/pretrain` trainer step is ~0.6% MFU** (measured: d=1536/L=12/seq=512/vocab=32000, slow-safe ON, one_hot CE → 9687 ms/step, 1.0 TFLOP/s). It trains correctly but is **dispatch-bound**, not compute-bound.
   - The **33.8% figure was a STANDALONE microbench** (clean matmul-MLP + vocab head, no slow-safe chunking, none of the GPT's per-op/host-roundtrip overheads) — NOT the real trainer. Earlier "GOAL ACHIEVED" claims based on it were an overstatement; corrected here.
   - **The fundamental limitation:** TT-XLA executes the step op-by-op from the host (~0.13 ms dispatch/op × tens of thousands of ops), multiplied by `slow_safe_linear` matmul chunking and the per-step host round-trips (si32→ui32 index, RNG `fold_in`). The matmul HW is fine (~63% of peak; clean step 35%) but starved. The cure (on-device trace/graph-replay) is **doubly blocked**: trace won't compile these graphs (host round-trips violate all-on-device) AND trace made a compute-bound step 4.4× *slower*. No model tweak fixes this — it needs a runtime-level fix (working trace or heavy op fusion).
-- **CE lever — partial win, not a full fix:** the one_hot→integer-label CE swap removes one big memory-bound sink and its grad is **bit-exact vs CPU** (`max|tt-cpu|=6.119e-09`), and `qwen_parity` stays byte-identical. BUT (a) it's only one of several stacked overheads, so it does NOT lift the dispatch-bound real trainer near 20%; and (b) it is **not shape-robust** — it compiles+runs on the trainer's synthetic config and a V=8192 gradcheck, but **fails (XlaRuntimeError 13) at V=32000/seq=512**. So it's a real but incomplete/fragile improvement, not a closed win.
+- **CE lever — partial win, not a full fix:** the one_hot→integer-label CE swap removes one big memory-bound sink and its grad is **bit-exact vs CPU** (`max|tt-cpu|=6.119e-09`), and Qwen2.5-0.5B inference stays byte-identical. BUT (a) it's only one of several stacked overheads, so it does NOT lift the dispatch-bound real trainer near 20%; and (b) it is **not shape-robust** — it compiles+runs on the trainer's synthetic config and a V=8192 gradcheck, but **fails (XlaRuntimeError 13) at V=32000/seq=512**. So it's a real but incomplete/fragile improvement, not a closed win.
 - **The CE backend mechanism** (`StableHLOToTTIRScatterOpConversionPattern`): route a batched scatter with `scatter_dims_to_operand_dims.size()==1` to the existing single-dim element-wise path (batching/row dims are position-aligned `update_scatter_dims`, handled by `extractElementWiseScatterIndices`' remap) — no flatten, CBs per-row. `checkBasicLegality` allows batching for single-scatter-dim and skips the `index_vector_dim==1` / `index.rank≤update.rank` checks when batched (non-batched RoPE path unchanged). The shape-robustness gap (V=32000 failure) is unresolved — likely a remaining L1/large-V or multi-batch-dim case.
 - **Ruled-out leads (do not pursue for MFU):** `enable_trace` (4.4× slower; also blocked by the host round-trips); fp8/fidelity (only raises the matmul ceiling, which was never the bottleneck).
 

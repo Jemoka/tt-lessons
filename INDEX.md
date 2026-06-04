@@ -69,11 +69,13 @@ Same op, three distinct failures (not duplicates):
 ## Performance
 
 - [tt-perf-trace-blocked-int-typecast-host-roundtrip](2026-06-03-tt-perf-trace-blocked-int-typecast-host-roundtrip/README.md)
-  — GPT training step was dispatch-bound; the decisive MFU lever was legalizing the
-  **batched** CE gather-VJP scatter (drops the big-vocab one_hot). **Fixed** (single-dim
-  routing) → 5.2% → 33.8% MFU, 20% goal met. The batched extension of
-  [ttxla-scatter-not-legalized](2026-06-03-ttxla-scatter-not-legalized/README.md).
-  Secondary (moot for MFU): an si32→ui32 index typecast host round-trip that blocks `enable_trace`.
+  — the real `gpt/train/pretrain` step is **~0.6% MFU (dispatch-bound)**, not fixed by a
+  model tweak (needs a runtime-level fix; `enable_trace`/fp8 are ruled-out dead ends).
+  The big-vocab one_hot CE → integer-label CE swap (legalizing the **batched** gather-VJP
+  scatter, the batched extension of
+  [ttxla-scatter-not-legalized](2026-06-03-ttxla-scatter-not-legalized/README.md)) is a
+  **partial + shape-fragile** improvement (grad bit-exact; fails to compile at V=32000/seq=512),
+  not the 20% win an earlier microbench suggested.
 
 ## Host upload / layout
 
