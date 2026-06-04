@@ -65,6 +65,10 @@ Same op, three distinct failures (not duplicates):
   — compiler aborts lowering a bf16 `tenstorrent.uniform` because the lowering reads
   its bounds with `getValues<float>()` (asserts on non-f32). **Fixed** (APFloat read).
   Consolidates a since-removed duplicate (`ttxla-uniform-rand-bf16-getvalues-float`).
+- [ttxla-ttnn-gather-int32-index-uint32-workaround](2026-06-04-ttxla-ttnn-gather-int32-index-uint32-workaround/README.md)
+  — `ttnn.gather` had no operand workaround, so an int32 `take_along_axis` index hit
+  tt-metal's UINT32/UINT16-only gather op and asserted. **Fixed** (si32→ui32 index
+  workaround). Surfaced by the integer-label CE forward gather (see the performance lesson).
 
 ## Performance
 

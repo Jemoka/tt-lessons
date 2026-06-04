@@ -1,0 +1,138 @@
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+index 0aa8f898c..6a88d6103 100644
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNOps.td
+@@ -1390,7 +1390,8 @@ def TTNN_ReshapeOp : TTNN_Op<"reshape", [TTNN_MemoryConfigOpInterface]> {
+     let extraClassDeclaration = [{
+       wa::TTNNOperandsWorkarounds getOperandsWorkarounds() {
+         RankedTensorType inputType = getInput().getType();
+-        return wa::TTNNOperandsWorkaroundsFactory::createReshapeOpOperandsWorkarounds(inputType);
++        RankedTensorType outputType = getResult().getType();
++        return wa::TTNNOperandsWorkaroundsFactory::createReshapeOpOperandsWorkarounds(inputType, outputType);
+       }
+     }];
+ }
+@@ -3046,6 +3047,12 @@ def TTNN_GatherOp : TTNN_Op<"gather", [TTNN_MemoryConfigOpInterface]> {
+ 
+     let results = (outs AnyRankedTensor:$result);
+ 
++    let extraClassDeclaration = [{
++      wa::TTNNOperandsWorkarounds getOperandsWorkarounds() {
++        return wa::TTNNOperandsWorkaroundsFactory::createGatherOpOperandsWorkarounds(getIndex().getType());
++      }
++    }];
++
+     let hasVerifier = 1;
+ }
+ 
+diff --git a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+index b7609aaa5..f3a62f6cd 100644
+--- a/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
++++ b/include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h
+@@ -278,13 +278,17 @@ public:
+   createWhereOpOperandsWorkarounds(mlir::Operation::operand_range inputs);
+ 
+   static TTNNOperandsWorkarounds
+-  createReshapeOpOperandsWorkarounds(RankedTensorType inputType);
++  createReshapeOpOperandsWorkarounds(RankedTensorType inputType,
++                                     RankedTensorType outputType);
+ 
+   static TTNNOperandsWorkarounds createDropoutOpOperandsWorkarounds();
+ 
+   static TTNNOperandsWorkarounds
+   createUpdateCacheOpOperandsWorkarounds(RankedTensorType updateIndex);
+ 
++  static TTNNOperandsWorkarounds
++  createGatherOpOperandsWorkarounds(RankedTensorType indexType);
++
+   static TTNNOperandsWorkarounds
+   createPagedUpdateCacheOpOperandsWorkarounds(Operation *op);
+ 
+diff --git a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+index 7b07238e1..a0fafa6e9 100644
+--- a/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
++++ b/lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp
+@@ -392,7 +392,7 @@ TTNNOperandsWorkaroundsFactory::createWhereOpOperandsWorkarounds(
+ // TT-metal issue: https://github.com/tenstorrent/tt-metal/issues/27843
+ TTNNOperandsWorkarounds
+ TTNNOperandsWorkaroundsFactory::createReshapeOpOperandsWorkarounds(
+-    RankedTensorType inputType) {
++    RankedTensorType inputType, RankedTensorType outputType) {
+   mlir::Type inputElementType = inputType.getElementType();
+   TTNNOperandWorkarounds typeWorkarounds;
+   mlir::tt::ttcore::DataType dataType =
+@@ -401,6 +401,46 @@ TTNNOperandsWorkaroundsFactory::createReshapeOpOperandsWorkarounds(
+     typeWorkarounds.tensorDataTypeWorkaround =
+         mlir::tt::ttcore::DataType::Int32;
+   }
++
++  // Tile-padded reshape workaround: a tilized tensor whose last two (tiled) dims
++  // are not multiples of the 32x32 tile is physically padded, so its physical
++  // volume exceeds its logical volume. A ttnn.reshape that merges/flattens such
++  // a padded dim then trips tt-metal's physical-volume equality check
++  // (infer_dims_for_reshape: "new_volume == old_volume") at runtime, e.g. a
++  // RoPE rotate_half gather-VJP reshaping a tile-padded n_head dim, or the
++  // attention dot_general reshapeRhs. Route such reshapes through row-major
++  // (physical == logical, no padding) by forcing the operands to RowMajor;
++  // row-major reshape is always volume-correct, and tile-aligned shapes (last
++  // two dims % 32 == 0) are left untouched. Either operand being tile-padded is
++  // enough — the padding can be on the input (merge of a padded dim) or only on
++  // the output (split into a padded dim).
++  // A tiled layout is padded iff its physical (tile-padded) element volume
++  // exceeds the tensor's logical volume. getScalarShardShape() returns the
++  // layout's collapsed memref shape expanded to scalar elements (i.e. the tiled
++  // dims rounded up to the 32x32 tile), so comparing its product to the logical
++  // volume detects padding regardless of how the layout collapsed the dims —
++  // unlike a per-dim "%32" check on the logical shape, which misses padding
++  // introduced by the collapse (e.g. the attention dot_general reshapeRhs).
++  auto isTilePadded = [](RankedTensorType type) -> bool {
++    auto layoutAttr =
++        mlir::dyn_cast_if_present<TTNNLayoutAttr>(type.getEncoding());
++    if (!layoutAttr || !layoutAttr.isTiled()) {
++      return false;
++    }
++    int64_t logicalVolume = 1;
++    for (int64_t d : type.getShape()) {
++      logicalVolume *= d;
++    }
++    int64_t physicalVolume = 1;
++    for (int64_t d : layoutAttr.getScalarShardShape()) {
++      physicalVolume *= d;
++    }
++    return physicalVolume != logicalVolume;
++  };
++  if (isTilePadded(inputType) || isTilePadded(outputType)) {
++    typeWorkarounds.tensorLayoutWorkaround = Layout::RowMajor;
++  }
++
+   return TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()
+       .addInputOperandWorkaround(typeWorkarounds)
+       .addOutputOperandWorkaround(typeWorkarounds);
+@@ -426,6 +466,27 @@ TTNNOperandsWorkaroundsFactory::createUpdateCacheOpOperandsWorkarounds(
+       .addInputOperandWorkaround(typeWorkarounds);
+ }
+ 
++// ttnn::gather requires the index tensor to be UInt32 or UInt16 (see tt-metal
++// gather_device_operation.cpp). StableHLO `gather` / torch `gather` indices
++// lower as signed Int32, so force the index operand (operand 1) to UInt32 when
++// it is signed integer. Input (operand 0) and output are left unconstrained.
++TTNNOperandsWorkarounds
++TTNNOperandsWorkaroundsFactory::createGatherOpOperandsWorkarounds(
++    RankedTensorType indexType) {
++  TTNNOperandWorkarounds nullWorkarounds;
++  TTNNOperandWorkarounds indexTypeWorkarounds;
++  mlir::tt::ttcore::DataType dataType =
++      mlir::tt::ttcore::elementTypeToDataType(indexType.getElementType());
++  if (dataType == mlir::tt::ttcore::DataType::Int32) {
++    indexTypeWorkarounds.tensorDataTypeWorkaround =
++        mlir::tt::ttcore::DataType::UInt32;
++  }
++  return TTNNOperandsWorkarounds::createEmptyTTNNOperandsWorkarounds()
++      .addInputOperandWorkaround(nullWorkarounds)
++      .addInputOperandWorkaround(indexTypeWorkarounds)
++      .addOutputOperandWorkaround(nullWorkarounds);
++}
++
+ TTNNOperandsWorkarounds
+ TTNNOperandsWorkaroundsFactory::createPagedUpdateCacheOpOperandsWorkarounds(
+     Operation *op) {

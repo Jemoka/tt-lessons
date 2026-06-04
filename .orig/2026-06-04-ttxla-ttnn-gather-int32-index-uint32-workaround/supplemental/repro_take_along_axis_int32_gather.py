@@ -6,7 +6,7 @@ After the fix (createGatherOpOperandsWorkarounds binding on TTNN_GatherOp):
   the index operand is auto-cast si32->ui32 and the gather runs; result must
   match the CPU reference bit-for-bit.
 
-Standalone pure JAX. Exercises the integer-label CE forward gather in isolation.
+Pure JAX, theseus-free. Exercises the integer-label CE forward gather in isolation.
 """
 import os
 os.environ.setdefault("JAX_PLATFORMS", "tt,cpu")

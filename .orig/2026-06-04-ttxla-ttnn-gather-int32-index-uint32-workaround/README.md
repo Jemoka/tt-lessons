@@ -2,7 +2,7 @@
 
 ## Summary
 
-Running the real GPT trainer (`gpt/train/pretrain`) on Blackhole crashed inside the
+Running the real theseus trainer (`theseus run gpt/train/pretrain`) on Blackhole crashed inside the
 JIT'd `train_step` with an opaque `jax.errors.JaxRuntimeError: INTERNAL: Error code: 13`. With
 `JAX_TRACEBACK_FILTERING=off` and the runtime logger on, the real cause surfaced as a tt-metal
 device-op assertion: `Index tensor must be of type UINT32 or UINT16. Got: DataType::INT32`
@@ -20,15 +20,13 @@ TTNN-workarounds pass auto-insert the cast, exactly as embedding and `update_cac
 - **Bug type:** missing backend op-legalization workaround (operand dtype), not a miscompile.
 - **Component:** tt-mlir, `TTNNWorkarounds` pass + `TTNN_GatherOp` definition (TTNN dialect).
 - **Fixed locally:** yes — `libTTMLIRCompiler.so` rebuilt and deployed to the local install tree and
-  the install tree (`third_party/tt-mlir/install/lib/libTTMLIRCompiler.so`).
+  to tt-qb2 (`third_party/tt-mlir/install/lib/libTTMLIRCompiler.so`).
 - **General:** fixes any JAX program whose `gather`/`take_along_axis` produces an int32 index, not
-  just the trainer that surfaced it.
-- **qwen-safe:** the workaround only rewrites a `ttnn.gather` operand dtype; Qwen2.5-0.5B inference
-  does not change (it has no training-loss gather), so parity is unaffected.
+  just theseus.
+- **qwen-safe:** the workaround only rewrites a `ttnn.gather` operand dtype; qwen2.5 inference does
+  not change (it has no training-loss gather), so parity is unaffected.
 - **Not resolved by this fix:** the separate big-vocab integer-label CE *backward* scatter shape work
-  and the dispatch-bound real-trainer MFU
-  ([2026-06-03-tt-perf-trace-blocked-int-typecast-host-roundtrip](/home/houjun/lessons/2026-06-03-tt-perf-trace-blocked-int-typecast-host-roundtrip/README.md))
-  are orthogonal. This forward-gather bug surfaced after switching the loss to integer-label CE.
+  (see the CE-scatter lesson) and the dispatch-bound real-trainer MFU are orthogonal.
 
 ## Repositories
 
@@ -36,22 +34,22 @@ TTNN-workarounds pass auto-insert the cast, exactly as embedding and `update_cac
   `412daacc440f10bb98ccc685c311b01f1fadab70`, worktree dirty (carries this fix plus prior in-flight
   scatter/reshape/bf16 fixes).
 - **tt-xla** (PJRT plugin host): `/home/houjun/tt-xla`, commit `03f29ed01a2bca27f5d8eaace659534016c7d0c4`.
-- The bug surfaced from a model whose loss uses integer-label CE (`take_along_axis`), which is what
-  emits the gather.
+- **theseus** (surfaced the bug): `/home/houjun/theseus`. `model/models/base.py loss()` uses
+  integer-label CE (`take_along_axis`), which is what emits the gather.
 
 ## Host Environment
 
 - Ubuntu 24.04, Linux 6.8.0-110-generic, Python 3.12, Clang 20.
 - jax==0.7.1, jaxlib==0.7.1; tt-xla PJRT plugin (editable install pointing at the source tree).
-- Device: Tenstorrent Blackhole p150b (4× p150b).
+- Device: Tenstorrent Blackhole p150b. Verified on `tt-qb2.stanford.edu` (4× p150b).
 - `ARCH_NAME=blackhole`, `JAX_PLATFORMS=tt,cpu`, `CONVERT_SHLO_TO_SHARDY=1`.
 
 ## User-Visible Failure
 
-The trainer died in `train_step` with only the opaque code:
+The trainer (and `demo.sh` step 3) died in `train_step` with only the opaque code:
 
 ```text
-  File ".../training/base.py", line 750, in train
+  File ".../theseus/training/base.py", line 750, in train
     self.state, loss, train_meta, grad_norm = train_step(...)
   ...
     results = self.xla_executable.execute_sharded(input_bufs)
@@ -69,7 +67,7 @@ TT_FATAL: Index tensor must be of type UINT32 or UINT16. Got: DataType::INT32
 ```
 
 The minimal reproducer (`take_along_axis` with an int32 index) fails the same way on the old compiler,
-isolating the cause to the gather op's index dtype — independent of the trainer, the optimizer, and the
+isolating the cause to the gather op's index dtype — independent of theseus, the optimizer, and the
 loss backward.
 
 ## Root Cause
@@ -122,17 +120,16 @@ reshape-workaround hunks in the same files are unrelated prior in-flight work).
 
 ## Reproduction Steps
 
-From a venv that has the TT PJRT plugin installed:
-
 ```bash
-source .venv/bin/activate
+cd /home/houjun/theseus && source .venv/bin/activate
 JAX_PLATFORMS=tt,cpu ARCH_NAME=blackhole CONVERT_SHLO_TO_SHARDY=1 TT_VISIBLE_DEVICES=<free-chip> \
 TTXLA_LOGGER_LEVEL=ERROR TTMLIR_RUNTIME_LOGGER_LEVEL=ERROR TT_METAL_LOGGER_LEVEL=ERROR \
-  python -u /home/houjun/lessons/2026-06-04-ttxla-ttnn-gather-int32-index-uint32-workaround/supplemental/repro_take_along_axis_int32_gather.py
+  python -u /home/houjun/.agents/gather_uint32_repro.py
 ```
 
-A full `gpt/train/pretrain` step reproduces it too (integer-label CE loss): on the old compiler it
-crashes in `train_step` with Error code 13; on the fixed compiler the step runs.
+Full-trainer reproduction: `theseus run tt-dbg configs/scratch/synthetic_pretrain.yaml /home/houjun/theseus
+-j gpt/train/pretrain training.tokens=8000 logging.report_interval=1` (with the same env). On the old
+compiler it crashes in `train_step` with Error code 13; on the fixed compiler the step runs.
 
 ### Surgical rebuild (no full superbuild)
 
@@ -156,7 +153,9 @@ llvm-ar r build/lib/libMLIRTTNNDialect.a \
 
 ## Verification
 
-PENDING on-device confirmation — queued behind device availability. Expected:
+PENDING on-device confirmation — queued behind chip contention on tt-qb2 (only two static-TLB
+chip-inits fit at once: jett's VM holds one, a helper's MFU sweep the other; a third init fails at
+`ll_api::configure_static_tlbs`). The repro is armed to run the instant a chip frees. Expected:
 
 ```text
 GATHER_REPRO shape=(2, 128) max|tt-cpu|=<~1e-4..1e-3>
