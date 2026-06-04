@@ -37,7 +37,15 @@ runtime binding — a deep compiler/runtime investigation.
   the full `jit(train_step)` graph. Producer op: `clip_fn` `div`
   (`optax/_src/.../_clipping.py:105`, inside the optimizer's `apply_gradients`).
 - Fixed locally: **No.** Localized; not yet root-caused to a specific id-assignment
-  line.
+  line. **A `getOperandThroughDPSOps` type-guard fix was TRIED and does NOT work**
+  (see Fix): adding `if (next.getType() != value.getType()) break;` to stop the DPS
+  walk at a shape-changing boundary was built, deployed (sha256-verified), and the
+  `wte→(1,)` FATAL **persisted** on the full trainer (helper-verified, chip 1).
+  Logic confirms why: with that guard `getOperandThroughDPSOps` always returns a
+  value whose type == `op.getInput()` type, so a call-site net-type-check is a no-op
+  too — **the misbind is type-INVISIBLE** (a buffer/global_id aliasing that does not
+  manifest as a type change at the DPS-walk level). qwen_parity stayed byte-identical
+  with the guard deployed (safe defensive no-op, not a regression — kept).
 - Eliminated by direct experiment (NOT the cause):
   - **global_norm / large reduce-to-scalar** — gating the logging `grad_norm`
     (the trainer's logging grad-norm) did not change it, and a standalone-JAX `global_norm`/`sum`/`sqrt(sum)`
@@ -111,18 +119,31 @@ not occur for `clip_by_global_norm` outside the full train-step graph.
 
 ## Fix
 
-Not implemented. Candidate directions:
-- **Compiler (most likely):** `FlatbufferObjectCache` assigns `global_id` per MLIR
-  Value (`obj.getAsOpaquePointer()`, monotonic `nextGlobalId()`) — so it is **not** a
-  cache keying collision; `global_id 1260` is exactly one Value (the clip-div
-  output). Therefore the scalar `ttnn.reshape`'s **serialized input resolves to that
-  Value**. Op input serialization uses `getOperandThroughDPSOps(input)`
-  (`TTNNToFlatbuffer.cpp`, e.g. FuncCall at :687 and per-op TensorRef lookups) — the
-  prime suspect is a **DPS-resolution mis-mapping** in the clip-and-apply graph: a
-  scalar reshape operand (typed scalar in IR) walks a destination-passing-style
-  chain that lands on the clip-div `[100288,256]` output, so its recorded
-  `global_id` becomes 1260. Audit `getOperandThroughDPSOps` against the clip
-  `div`/`where`/broadcast ops.
+Not implemented. The misbind is **type-invisible** (a buffer/global_id aliasing that
+does not show up as a shape/type change), so type-based serializer guards do NOT fix
+it (see below). Candidate directions:
+- **DPS type-guard — TRIED, DOES NOT WORK.** `FlatbufferObjectCache` assigns
+  `global_id` per MLIR Value (`obj.getAsOpaquePointer()`, monotonic), so it is not a
+  cache keying collision. The hypothesis was that op-input serialization
+  (`getOperandThroughDPSOps(input)`, `TTNNToFlatbuffer.cpp`) walks the scalar
+  reshape's input across a *shape-changing* DPS-init boundary onto the clip-div
+  `[100288,256]` output. Fix tried: add `if (next.getType() != value.getType())
+  break;` in `getOperandThroughDPSOps` (`FuncOpToProgram.h`). Built + deployed
+  (sha256-verified) → **FATAL persisted** (helper-verified on the full trainer).
+  Reason: with the guard, the walk only ever traverses *same-type* steps, so its
+  result type always equals `op.getInput()`'s — i.e. the divergence is **not** a
+  type change at any DPS step, and a call-site net-type-check is equally a no-op.
+  qwen_parity byte-identical with the guard (safe; kept as defensive no-op).
+- **Real direction (type-invisible aliasing):** the scalar reshape's recorded
+  `TensorRef` ends up being the clip-div output's `global_id` without a type change
+  — i.e. two Values genuinely share a buffer/dest at the *runtime* level
+  (`getOrCreate`/`getOrCreateNoSharding` on `op.getResult()`, or DPS dest-buffer
+  reuse where dest and result happen to be same-typed at the crossing). Pin it with
+  the **defensive bind-time shape-assert** at `program_executor.cpp` (catch the
+  mismatch loudly at the bind, naming the two global_ids), and/or trace the failing
+  reshape's input `global_id` back to **every op that records that same global_id**
+  in the serializer (not just the type-changing ones). The clip `div`/`where`/
+  broadcast apply chain is still where to look.
   Mechanism detail (`getOperandThroughDPSOps`, `FuncOpToProgram.h`): it walks
   `while (isa<DestinationStyleOpInterface>(op)) value = dps.getDpsInitOperand(0)->get()`
   — i.e. follows the **DPS destination/init** operand up the chain, **asserting
