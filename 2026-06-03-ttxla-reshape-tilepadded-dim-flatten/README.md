@@ -23,7 +23,15 @@ routing through row-major / `to_layout` (which would drop the padding).
   tile padding when flattening a non-32-aligned dim; runtime FATAL.
 - Component: tt-mlir TTIR→TTNN reshape lowering (the `ttnn.reshape` between
   `#ttnn_layout129` and `#ttnn_layout130` below); surfaced via the RoPE gather VJP.
-- Fixed locally: **No.** Pinned (op + layouts + source).
+- Fixed locally: **Yes** (verified). A `ttnn.reshape` operand workaround forces
+  RowMajor layout when an operand is tile-padded (physical volume ≠ logical),
+  routing the flatten through row-major so padding is dropped. See Fix. Confirmed:
+  the RoPE gather-grad reshape (`64x8x128x4 → 64x4096`) now lowers and the trainer
+  advances past it (the failure then moves to a separate optimizer clip-binding
+  bug — see
+  [2026-06-03-ttxla-trainer-clip-wte-global-id-misbind](/home/houjun/lessons/2026-06-03-ttxla-trainer-clip-wte-global-id-misbind/README.md)).
+  qwen_parity inference is byte-identical (no regression — the workaround only
+  fires on tile-padded reshapes, which inference does not hit).
 - Trigger: a reshape that flattens a tile-padded dim whose size is not a multiple
   of 32 (here `n_head = 4`). A model with `n_head % 32 == 0` would avoid it.
 - Scope: training (the gather-grad path). Inference is unaffected (no such reshape
@@ -93,12 +101,36 @@ embedding-backward grad bug
 
 ## Fix
 
-Not implemented. The tt-mlir reshape lowering that emits this `ttnn.reshape` must
-account for tile padding: when an operand's flattened/affected dim is tile-padded
-(not a multiple of 32), insert a `to_layout`→RowMajor (untilize) before the reshape
-(and re-tilize after), so physical volume equals logical. Alternatively, the
-gather/take VJP lowering should avoid placing the size-`n_head` dim in the tiled
-last-two-dims position. Verify a fix with the trainer reproducer below.
+**Implemented + verified.** A `ttnn.reshape` operand workaround in
+`TTNNWorkaroundsPass`: force RowMajor layout for the reshape operands when either
+operand is tile-padded, so the flatten runs in row-major (physical == logical, no
+padding) and is re-tilized afterward by the workaround framework. Row-major reshape
+is always volume-correct, and tile-aligned reshapes are untouched. Patch:
+[supplemental/ttmlir_reshape_rowmajor_workaround.patch](/home/houjun/lessons/2026-06-03-ttxla-reshape-tilepadded-dim-flatten/supplemental/ttmlir_reshape_rowmajor_workaround.patch).
+
+Three changes in tt-mlir (rebuilt `libTTMLIRCompiler.so`, surgical relink):
+1. `TTNNOperandsWorkaroundsFactory::createReshapeOpOperandsWorkarounds`
+   (`lib/Dialect/TTNN/IR/TTNNWorkaroundsPass.cpp`): an `isTilePadded()` helper
+   (`product(layout.getScalarShardShape()) != product(tensor.getShape())` for a
+   tiled layout — this catches padding from the layout's *collapsed* memref, which
+   a per-dim "logical last-2 % 32" check misses, e.g. the attention
+   `dot_general reshapeRhs`); force `Layout::RowMajor` when **either** the input or
+   output is tile-padded.
+2. The factory signature gained the `outputType` (a `[1]`-target reshape whose
+   *output* is the padded operand is also covered).
+3. `TTNNOps.td` `ReshapeOp::getOperandsWorkarounds` passes `getResult().getType()`.
+
+Verification (on HW, helper-confirmed): the RoPE `_take` grad reshape becomes
+row-major (`#ttnn_layout` with no `tile<32x32>`, phys == logical); ~150 `row_major`
+to_layouts inserted across the module; the trainer no longer FATALs here. The
+**evolution of the detection heuristic mattered**: an initial input-only,
+logical-last-2-`%32` check fixed the RoPE reshape but missed the output-tiled
+`dot_general reshapeRhs`; switching to the both-operands physical-vs-logical-volume
+check (above) covers all tile-padded reshapes in the module.
+
+(Earlier alternative — have the gather/take VJP lowering avoid placing the
+size-`n_head` dim in the tiled last-two-dims position — is unnecessary given the
+operand workaround.)
 
 ## Minimal Reproducer
 
