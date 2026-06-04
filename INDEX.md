@@ -16,7 +16,11 @@ each is exposed once the previous is cleared.
    workaround landed; compiler unpatched.
 3. [ttxla-reshape-tilepadded-dim-flatten](2026-06-03-ttxla-reshape-tilepadded-dim-flatten/README.md)
    — `ttnn.reshape` FATAL flattening a tile-padded `n_head` dim in the RoPE
-   gather grad. Open.
+   gather grad. **Fixed** (RowMajor reshape workaround).
+4. [ttxla-trainer-clip-wte-global-id-misbind](2026-06-03-ttxla-trainer-clip-wte-global-id-misbind/README.md)
+   — a scalar `ttnn.reshape` is runtime-bound to the wte tensor (`global_id 1260`)
+   in the `optax.clip_by_global_norm` graph. Open; whole-program (no standalone
+   repro).
 
 ## Tile-padding in backward ops (same mechanism, different op)
 

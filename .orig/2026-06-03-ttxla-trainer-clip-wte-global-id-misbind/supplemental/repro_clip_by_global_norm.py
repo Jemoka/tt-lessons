@@ -1,9 +1,9 @@
-"""Standalone JAX probe for the TT FATAL pinned to optax.clip_by_global_norm.
+"""Minimal theseus-free reproducer for the TT FATAL pinned to optax.clip_by_global_norm.
 
-Runtime trace: the wte-sized clipped grad [100288,256] (global_id 1260, vol
-25,673,728) is read by a reshape->[1] produced by
+Primary's runtime trace (talk.md): the wte-sized clipped grad [100288,256] (global_id
+1260, vol 25,673,728) is read by a reshape->[1] produced by
 optax.clip_by_global_norm.<locals>.clip_fn (_clipping.py:105), inside apply_gradients.
-The standalone optax.global_norm probe PASSED, so the bug is in the CLIP-AND-APPLY
+The standalone optax.global_norm repro PASSED, so the bug is in the CLIP-AND-APPLY
 chain (global_norm -> div -> rescale of each leaf), not global_norm alone.
 
 This isolates `optax.clip_by_global_norm(1.0).update(grads, state)` on a grad pytree
@@ -18,8 +18,8 @@ A TT_FATAL is a SIGABRT Python can't catch; each variant prints `>> trying` firs
 the last line before a core dump names the culprit.
 
 Run (one healthy chip):
-  TT_VISIBLE_DEVICES=1 CONVERT_SHLO_TO_SHARDY=1 JAX_PLATFORMS=tt,cpu \
-    ARCH_NAME=blackhole python repro_clip_by_global_norm.py
+  TT_VISIBLE_DEVICES=1 CONVERT_SHLO_TO_SHARDY=1 \
+    python /home/houjun/.agents/repro_clip_by_global_norm.py
 """
 
 import os

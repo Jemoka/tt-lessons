@@ -30,7 +30,7 @@ routing through row-major / `to_layout` (which would drop the padding).
   advances past it (the failure then moves to a separate optimizer clip-binding
   bug — see
   [2026-06-03-ttxla-trainer-clip-wte-global-id-misbind](/home/houjun/lessons/2026-06-03-ttxla-trainer-clip-wte-global-id-misbind/README.md)).
-  qwen_parity inference is byte-identical (no regression — the workaround only
+  Qwen2.5-0.5B inference is byte-identical (no regression — the workaround only
   fires on tile-padded reshapes, which inference does not hit).
 - Trigger: a reshape that flattens a tile-padded dim whose size is not a multiple
   of 32 (here `n_head = 4`). A model with `n_head % 32 == 0` would avoid it.

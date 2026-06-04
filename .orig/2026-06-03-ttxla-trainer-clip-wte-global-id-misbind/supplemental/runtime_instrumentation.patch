@@ -1,0 +1,76 @@
+diff --git a/runtime/lib/ttnn/operations/data_movement/reshape.cpp b/runtime/lib/ttnn/operations/data_movement/reshape.cpp
+index 86a17d4d9..2013eedf8 100644
+--- a/runtime/lib/ttnn/operations/data_movement/reshape.cpp
++++ b/runtime/lib/ttnn/operations/data_movement/reshape.cpp
+@@ -16,6 +16,15 @@ void run(const ::tt::target::ttnn::ReshapeOp *op, ProgramContext &context) {
+ 
+   const auto *fbShape = op->shape();
+   std::vector<int32_t> shape(fbShape->begin(), fbShape->end());
++
++  // RESHAPE_DBG: a scalar-target reshape ([1]) whose input is a large tensor is
++  // the wte-buffer-misbinding case — log the in/out global_ids + input volume so
++  // the mis-bound slot can be traced to its producer/binding.
++  if (in.logical_volume() > 1 && shape.size() == 1 && shape[0] == 1) {
++    LOG_WARNING("RESHAPE_DBG misbind: in_global_id=", op->in()->global_id(),
++                " out_global_id=", op->out()->global_id(),
++                " in_logical_volume=", in.logical_volume(), " target=[1]");
++  }
+   std::optional<::ttnn::MemoryConfig> memoryConfig =
+       op->memory_config() == 0
+           ? ::tt::runtime::ttnn::utils::createMemoryConfigIfNeeded(
+diff --git a/runtime/lib/ttnn/program_executor.cpp b/runtime/lib/ttnn/program_executor.cpp
+index d4d671be0..919fc00a5 100644
+--- a/runtime/lib/ttnn/program_executor.cpp
++++ b/runtime/lib/ttnn/program_executor.cpp
+@@ -142,6 +142,20 @@ ProgramExecutor::ProgramExecutor(
+              "Program input size mismatch: ", program->inputs()->size(),
+              " != ", programInputs.size());
+   for (const ::tt::target::ttnn::TensorRef *input : *program->inputs()) {
++    // FUNCCALL_DBG: log the nested-program input binding (callee slot global_id +
++    // its IR-expected shape) so a func-call positional mismatch (wte buffer bound
++    // to a scalar slot like global_id 1260) is visible.
++    {
++      std::string sh;
++      if (input->desc() && input->desc()->shape()) {
++        for (auto d : *input->desc()->shape()) {
++          sh += std::to_string(d) + ",";
++        }
++      }
++      LOG_WARNING("FUNCCALL_DBG bind slot k=", inputIndex,
++                  " callee_global_id=", input->global_id(),
++                  " expected_shape=[", sh, "]");
++    }
+     auto [iter, inserted] = liveTensors.try_emplace(
+         input->global_id(), &(programInputs[inputIndex++]));
+     LOG_ASSERT(inserted, "Duplicate input tensor");
+@@ -204,6 +218,10 @@ void ProgramExecutor::execute() {
+         perf::Env::get().tracyProgramMetadata);
+     runOpCallback(debug::Hooks::get().getPreOperatorCallback(),
+                   executableHandle, op, context.get());
++    // OPEXEC_DBG: log each op's source loc; the op logged immediately before the
++    // GID_DBG write to global_id 1260 is the producer of the wte-shaped tensor.
++    LOG_WARNING("OPEXEC_DBG loc=",
++                op->loc_info() ? op->loc_info()->c_str() : "?");
+     runOperation(op);
+ #if defined(TT_RUNTIME_DEBUG) && TT_RUNTIME_DEBUG == 1
+     syncAfterOpIfNeeded();
+diff --git a/runtime/lib/ttnn/types/types.cpp b/runtime/lib/ttnn/types/types.cpp
+index a284bf779..5dcb3be32 100644
+--- a/runtime/lib/ttnn/types/types.cpp
++++ b/runtime/lib/ttnn/types/types.cpp
+@@ -178,6 +178,15 @@ ProgramTensorPool::insertRuntimeTensorAndValidate(
+   DEBUG_ASSERT(ttnnTensor.is_allocated());
+   debug::checkTensorRefMatchesTTNNTensor(tensorRef, ttnnTensor);
+ 
++  // GID_DBG: trace writes to the mis-bound slot (global_id 1260) — log shape and
++  // whether this is an overwrite (insert_or_assign), which would reveal a
++  // global_id collision (a scalar and the wte tensor sharing an id).
++  if (globalId == 1260) {
++    bool overwrite = intermedTensors.find(globalId) != intermedTensors.end();
++    LOG_WARNING("GID_DBG write global_id=1260 logical_volume=",
++                ttnnTensor.logical_volume(), " overwrite=", overwrite);
++  }
++
+   auto [iter, inserted] =
+       intermedTensors.insert_or_assign(globalId, runtimeTensor);
+ 

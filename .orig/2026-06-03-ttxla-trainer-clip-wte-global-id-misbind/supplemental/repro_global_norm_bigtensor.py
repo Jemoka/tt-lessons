@@ -2,18 +2,18 @@
 tensor [100288,256] reproduces the trainer's `reshape new_volume==old_volume`
 (old_logical_volume=25673728 -> target=(1,)) FATAL on TT — and test TT-safe forms.
 
-Adjudicates which op produces wte->[1]: is it (a) optax.global_norm reducing the
-wte gradient leaf, or (b) a runtime buffer-binding feeding wte to a scalar
-reshape? Standalone JAX: if VARIANT A/B FATAL on TT with the wte shape, the cause
-is the large-tensor reduce-to-scalar lowering (global_norm), independent of any
-trainer donation/aliasing. If they all PASS, the trainer FATAL is NOT this op
+Adjudicates the open dispute (talk.md): is wte->[1] (a) optax.global_norm reducing
+the wte gradient leaf, or (b) a runtime buffer-binding feeding wte to a scalar
+reshape? This is theseus-free: if VARIANT A/B FATAL on TT with the wte shape, the
+cause is the large-tensor reduce-to-scalar lowering (global_norm), independent of
+any trainer donation/aliasing. If they all PASS, the trainer FATAL is NOT this op
 -> supports the runtime-binding theory.
 
 Also empirically finds a TT-safe global_norm (variants D/E: staged reductions).
 
-Run (one healthy chip):
-  TT_VISIBLE_DEVICES=1 CONVERT_SHLO_TO_SHARDY=1 JAX_PLATFORMS=tt,cpu \
-    ARCH_NAME=blackhole python repro_global_norm_bigtensor.py
+Run (one healthy chip; chip 1 on tt-qb2 per talk.md):
+  TT_VISIBLE_DEVICES=1 CONVERT_SHLO_TO_SHARDY=1 \
+    python /home/houjun/.agents/repro_global_norm_bigtensor.py
 """
 
 import os
