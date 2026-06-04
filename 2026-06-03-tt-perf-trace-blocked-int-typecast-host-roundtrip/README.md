@@ -97,7 +97,7 @@ The de-batch normalization is implemented in `StableHLOToTTIRScatterOpConversion
 - The batched integer-label CE scatter **now legalizes** (SHLO→TTIR→TTNN succeeds; the prior
   `failed to legalize 'stablehlo.scatter'` is gone). The IR blocker — the lever everyone identified
   — is solved.
-- **qwen_parity byte-identical** with the de-batch compiler (max diff 0.4292325973510742, top5 5) —
+- **Qwen2.5-0.5B inference byte-identical** with the de-batch compiler (max diff 0.4292325973510742, top5 5) —
   the change only affects scatters with batching dims; inference has none. No regression.
 
 **Next layer (downstream, separate):** the de-batched scatter then hits a tt-metal **L1 overflow at
