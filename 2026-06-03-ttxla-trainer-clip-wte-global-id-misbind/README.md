@@ -1,5 +1,18 @@
 # TT Trainer: wte Buffer Reaches a Scalar `ttnn.reshape` Slot (optax clip_by_global_norm graph)
 
+> **RESOLVED — root cause was NOT a serializer gid mis-stamp.** This lesson's
+> case-(b) "global_id mis-stamp" / pointer-collision theory was disproven by
+> direct instrumentation (180 serialized reshapes, 0 with a mis-shaped input ref;
+> the failing `ttnn::reshape` is invoked internally by a binary op's broadcast,
+> not a serialized `ReshapeOp`). Actual root cause: `ttnn::embedding_bw` returns a
+> **rank-4** tensor while the IR declares rank-2, so the downstream `global_norm`
+> reduce (`dim_arg=[0,1]`) reduces only the leading unit dims and leaves the full
+> `[100288,256]` wte gradient in a scalar slot — which then hits the broadcast
+> reshape. Fixed in
+> [2026-06-03-ttxla-embedding-bw-reduce-rank-mismatch](/home/houjun/lessons/2026-06-03-ttxla-embedding-bw-reduce-rank-mismatch/README.md).
+> The analysis below is retained for the diagnostic trail; treat its conclusions
+> as superseded.
+
 ## Summary
 
 After the tile-padded reshape fix
