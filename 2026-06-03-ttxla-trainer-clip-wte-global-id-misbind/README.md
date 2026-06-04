@@ -112,9 +112,17 @@ not occur for `clip_by_global_norm` outside the full train-step graph.
 ## Fix
 
 Not implemented. Candidate directions:
-- **Compiler:** audit tt-mlir's TTNN flatbuffer `global_id` assignment
-  (`FlatbufferObjectCache`) for the clip-and-apply graph — find why a scalar
-  reshape input and the clip-div output collide on `global_id 1260`.
+- **Compiler (most likely):** `FlatbufferObjectCache` assigns `global_id` per MLIR
+  Value (`obj.getAsOpaquePointer()`, monotonic `nextGlobalId()`) — so it is **not** a
+  cache keying collision; `global_id 1260` is exactly one Value (the clip-div
+  output). Therefore the scalar `ttnn.reshape`'s **serialized input resolves to that
+  Value**. Op input serialization uses `getOperandThroughDPSOps(input)`
+  (`TTNNToFlatbuffer.cpp`, e.g. FuncCall at :687 and per-op TensorRef lookups) — the
+  prime suspect is a **DPS-resolution mis-mapping** in the clip-and-apply graph: a
+  scalar reshape operand (typed scalar in IR) walks a destination-passing-style
+  chain that lands on the clip-div `[100288,256]` output, so its recorded
+  `global_id` becomes 1260. Audit `getOperandThroughDPSOps` against the clip
+  `div`/`where`/broadcast ops.
 - **Defensive runtime guard:** at `program_executor.cpp` bind/insert time, assert
   the bound tensor's logical shape matches the `TensorRef`'s expected shape — this
   converts the confusing downstream reshape FATAL into a clear "global_id N shape
