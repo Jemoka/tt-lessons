@@ -90,11 +90,18 @@ Alternatives: (a) feed `uint32` token indices from the framework so no cast is n
 
 ## Reproduction Steps
 
+From a venv that has the TT PJRT plugin installed:
+
 ```bash
-ssh houjun@tt-qb2.stanford.edu
-cd /home/houjun/theseus && source .venv/bin/activate
-# dispatch-bound MFU (compute-dense step):
-ARCH_NAME=blackhole JAX_PLATFORMS=tt,cpu TT_VISIBLE_DEVICES=2 python /home/houjun/.agents/mfu_bench.py
+source .venv/bin/activate
+# standalone MFU bench (minimal GPT, big-vocab one_hot CE):
+ARCH_NAME=blackhole JAX_PLATFORMS=tt,cpu TT_VISIBLE_DEVICES=0 \
+  python /home/houjun/lessons/2026-06-03-tt-perf-trace-blocked-int-typecast-host-roundtrip/supplemental/mfu_bench.py
+# matmul roofline anchor:
+ARCH_NAME=blackhole JAX_PLATFORMS=tt,cpu TT_VISIBLE_DEVICES=0 \
+  python /home/houjun/lessons/2026-06-03-tt-perf-trace-blocked-int-typecast-host-roundtrip/supplemental/roofline_amortized.py
+# dump the batched CE-VJP scatter dims (CPU only):
+python /home/houjun/lessons/2026-06-03-tt-perf-trace-blocked-int-typecast-host-roundtrip/supplemental/dump_ce_scatter.py
 # trace-blocker: compile a step with enable_trace and observe the from_device error
 #   (set via compiler_options or the TTXLA_COMPILE_OPTIONS env bridge — see Notes)
 ```
@@ -113,6 +120,6 @@ enable_trace:            FAILS to compile (from_device on si32 index)  [the bloc
 
 - **MFU denominators (sourced):** bf16-HiFi4 = 175, bfp8-HiFi2 = 351, bfp4-LoFi = 702 TFLOP/s board peak (130 cores × {1.35, 2.7, 5.4}); ~83% achievable. The "664 BlockFP8" headline is the fp8/LoFi tier. 20% MFU vs bf16 peak = 35 TFLOP/s (reachable iff dispatch overhead is killed); vs 664 = 133 TFLOP/s (needs fp8 emission + matmul-bound).
 - **Timing methodology:** host wall-clock can't measure TT compute naively (≈0.13 ms dispatch floor; full readback is transfer-bound). Use a jitted unrolled dependency-chain + scalar hard-sync (`supplemental/roofline_amortized.py`); for a compute-dense full step, the step ≫ dispatch floor so plain `block_until_ready` timing is valid.
-- **Knob plumbing:** `enable_trace`, `experimental_weight_dtype` (bfp_bf8/bf4), `math_fidelity`, `ttnn_perf_metrics_enabled` are all JAX-settable PJRT compile options, but theseus calls bare `jax.jit`. A tt-xla env-var bridge (`TTXLA_COMPILE_OPTIONS="enable_trace=true,…"`, `compile_options.cc`) was added so the real trainer can set them with zero theseus edits.
+- **Knob plumbing:** `enable_trace`, `experimental_weight_dtype` (bfp_bf8/bf4), `math_fidelity`, `ttnn_perf_metrics_enabled` are all JAX-settable PJRT compile options, but a trainer that calls bare `jax.jit` can't pass them. A tt-xla env-var bridge (`TTXLA_COMPILE_OPTIONS="enable_trace=true,…"`, `compile_options.cc`) was added so the trainer can set them with zero trainer edits.
 
-- **Implementation note (landing strategy):** the existing scatter helpers read `srcOp` directly, so land the de-batch as a *pre-normalization* — emit a new `stablehlo.scatter` with cleared batching dims + iota-concat-augmented indices + merged dim numbers, replace `srcOp` with it, and let the existing multi-dim path lower the new op (don't thread new dims through the helpers). agent3's full drop-in sketch (iota per batch dim, ordered concat, merged scatter/inserted dims, reduce=add, multi-update guard) is in talk.md.
+- **Implementation note (landing strategy):** the existing scatter helpers read `srcOp` directly, so land the de-batch as a *pre-normalization* — emit a new `stablehlo.scatter` with cleared batching dims + iota-concat-augmented indices + merged dim numbers, replace `srcOp` with it, and let the existing multi-dim path lower the new op (don't thread new dims through the helpers). The full drop-in shape is: iota per batch dim, ordered concat, merged scatter/inserted dims, reduce=add, with a multi-update guard.

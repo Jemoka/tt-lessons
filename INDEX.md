@@ -66,6 +66,15 @@ Same op, three distinct failures (not duplicates):
   its bounds with `getValues<float>()` (asserts on non-f32). **Fixed** (APFloat read).
   Consolidates a since-removed duplicate (`ttxla-uniform-rand-bf16-getvalues-float`).
 
+## Performance
+
+- [tt-perf-trace-blocked-int-typecast-host-roundtrip](2026-06-03-tt-perf-trace-blocked-int-typecast-host-roundtrip/README.md)
+  — GPT training step is dispatch-bound; the decisive MFU lever is legalizing the
+  **batched** CE gather-VJP scatter (drops the big-vocab one_hot). Related to the
+  training-bring-up scatter lesson (the batched extension of
+  [ttxla-scatter-not-legalized](2026-06-03-ttxla-scatter-not-legalized/README.md)).
+  Secondary: an si32→ui32 index typecast host round-trip that blocks `enable_trace`.
+
 ## Host upload / layout
 
 - [ttxla-non-row-major-host-upload](2026-04-23-ttxla-non-row-major-host-upload/README.md)
