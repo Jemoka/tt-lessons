@@ -87,6 +87,18 @@ type for token ids), which lowers through `ttir.gather_dim` → `ttnn.gather` un
 (`GatherDimOpConversionPattern` forwards `adaptor.getIndex()` with no cast). Nothing downstream
 corrected the dtype because the workaround was simply missing.
 
+**There are two sub-problems, and fixing only the first is not enough.** Declaring the workaround on
+the op (sub-problem 1) does nothing on its own, because the `TTNNWorkarounds` pass only *applies*
+operand workarounds to an op whose name is in an `enabledOps` allow-set. That set is built two ways
+(`TTNNWorkaroundsPatterns.cpp`, `TTNNWorkarounds::runOnOperation`): when the optimizer is **off** it is
+*all* TTNN dialect ops, but when the optimizer is **on** it is a small curated literal
+`enabledOpsForWorkaroundWithOptimizer = {WhereOp, FullOp, EmbeddingOp, ScatterOp}`. tt-xla compiles
+with the optimizer **on**, so `ttnn.gather` was filtered out by the allow-set and its
+`getOperandsWorkarounds()` was never even consulted. The first deploy (workaround factory + binding
+only) therefore failed on-device with the identical `Got: DataType::INT32` assertion — the symptom is
+indistinguishable, so verify on hardware, not just that the symbol links. (Embedding/Scatter never hit
+this because they are already in the curated set.)
+
 ## Fix
 
 Mirror the embedding / `update_cache` index workaround for gather:
@@ -98,6 +110,9 @@ Mirror the embedding / `update_cache` index workaround for gather:
 2. `include/ttmlir/Dialect/TTNN/IR/TTNNWorkaroundsPass.h` — declare the factory method.
 3. `include/ttmlir/Dialect/TTNN/IR/TTNNOps.td` — give `TTNN_GatherOp` an `extraClassDeclaration`
    `getOperandsWorkarounds()` that calls the new factory with `getIndex().getType()`.
+4. `lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp` — add
+   `ttnn::GatherOp::getOperationName()` to the `enabledOpsForWorkaroundWithOptimizer` literal set, so
+   the workaround actually runs under the optimizer (the step the first deploy was missing).
 
 The `TTNNWorkarounds` pass then inserts the `si32 → ui32` typecast on the index automatically. Token
 ids are non-negative, so the reinterpret is value-safe (no signed values to lose).
@@ -156,19 +171,29 @@ llvm-ar r build/lib/libMLIRTTNNDialect.a \
 
 ## Verification
 
-PENDING on-device confirmation — queued behind device availability. Expected:
+Done in two on-device rounds, which is itself the key lesson:
+
+- **Round 1 (workaround factory + binding only):** deployed `libTTMLIRCompiler.so` with the new symbol
+  confirmed present (`nm -C | grep createGatherOpOperandsWorkarounds`) and the plugin confirmed
+  resolving to it (`ldd`). The repro **still aborted with the identical** `Got: DataType::INT32`. This
+  proved the binding alone is inert — the op was being filtered out by the optimizer `enabledOps`
+  allow-set before its workaround was consulted.
+- **Round 2 (after adding `GatherOp` to `enabledOpsForWorkaroundWithOptimizer`):** rebuilt + redeployed.
+
+Expected Round-2 result:
 
 ```text
 GATHER_REPRO shape=(2, 128) max|tt-cpu|=<~1e-4..1e-3>
 GATHER_REPRO_PASS
 ```
 
-Compile-time evidence already in hand: the fix is a 1:1 structural mirror of the
-`createUpdateCacheOpOperandsWorkarounds` index workaround (proven to insert the `si32→ui32` typecast),
-and the regenerated `TTNNOps.h.inc` diffs to exactly the one `GatherOp::getOperandsWorkarounds()`
-override and nothing else.
+_(Round-2 on-device confirmation was in flight when qb2 sshd dropped; update this block with the
+measured `max|tt-cpu|` once the run is read back. The first round is fully verified as FAILING, which
+is what pinned the allow-set sub-problem.)_
 
-_(Update this section with the measured numbers once the queued run completes.)_
+Takeaway: a missing-workaround fix is not verified by the symbol linking or the IR header
+regenerating — only by the op actually running on hardware, because the allow-set filter makes a
+correctly-declared-but-unlisted workaround fail with a symptom identical to no fix at all.
 
 ## Notes
 

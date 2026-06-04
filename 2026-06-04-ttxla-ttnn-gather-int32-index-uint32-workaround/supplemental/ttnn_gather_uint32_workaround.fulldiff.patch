@@ -136,3 +136,15 @@ index 7b07238e1..a0fafa6e9 100644
  TTNNOperandsWorkarounds
  TTNNOperandsWorkaroundsFactory::createPagedUpdateCacheOpOperandsWorkarounds(
      Operation *op) {
+diff --git a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
+index ad4db6ac3..7fb67edf3 100644
+--- a/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
++++ b/lib/Dialect/TTNN/Transforms/Workarounds/TTNNWorkaroundsPatterns.cpp
+@@ -674,5 +674,6 @@ const std::set<mlir::StringRef>
+     TTNNWorkarounds::TTNNWorkarounds::enabledOpsForWorkaroundWithOptimizer = {
+         ttnn::WhereOp::getOperationName(), ttnn::FullOp::getOperationName(),
+         ttnn::EmbeddingOp::getOperationName(),
+-        ttnn::ScatterOp::getOperationName()};
++        ttnn::ScatterOp::getOperationName(),
++        ttnn::GatherOp::getOperationName()};
+ } // namespace mlir::tt::ttnn
