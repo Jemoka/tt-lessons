@@ -64,6 +64,22 @@ The integer-label CE gradient emits `stablehlo.scatter` with **batching dims** (
 ### Fix (scoped): de-batch the scatter in the conversion pattern
 In `StableHLOToTTIRScatterOpConversionPattern` (`StableHLOToTTIRPatterns.cpp:6086`): when batching dims are present, **rewrite them to explicit indices** — iota over each batch dim, concat into `scatter_indices` along `index_vector_dim`, move the batch dims from `input_batching_dims` into `scatter_dims_to_operand_dims`, and clear the batching dims. This reduces the batched CE scatter to the **multi-dimensional** scatter form the pattern already supports (:6118-6144, requires `index_vector_dim`=last and `scatter_dims ⊇ inserted_window`). Then `extractElementWiseScatterIndices`/matchAndRewrite build the flat index against the de-batched multi-dim shape. **qwen-safe** (no inference scatter); **training-correctness-critical** — must verify the loss gradient is bit-exact (existing `repro_scatter_legalize.py` pattern) + a training smoke converges, before landing. This is the precise, bounded next backend task and the highest-value MFU lever.
 
+### Turnkey de-batch spec (exact, captured from the flattened CE VJP)
+
+Flattened integer-label CE (`logits [BT,V]`, labels `[BT]`, `take_along_axis` then mean) — grad SHLO (captured CPU, `dump_ce_scatter.py`):
+```
+stablehlo.scatter(operand[BT,V], indices, updates) {
+  inserted_window_dims = [1], scatter_dims_to_operand_dims = [1], index_vector_dim = 2,
+  input_batching_dims = [0], scatter_indices_batching_dims = [0] }   <-- batch over the BT rows
+```
+**De-batch (reduces exactly to the supported multi-dim path):**
+1. `iota_b` = iota over the batch operand-dim (size BT), shaped to the indices' non-vector layout and placed at `index_vector_dim`.
+2. `new_indices = concatenate([iota_b, scatter_indices], dim=index_vector_dim)` → index vector now `[batch_idx, col_idx]`.
+3. New dim numbers: `scatter_dims_to_operand_dims = [0,1]`, `inserted_window_dims = [0,1]`, `index_vector_dim = last`, **batching dims cleared**.
+4. Result satisfies the existing multi-dim checks (6118-6144: `index_vector_dim`=last ✓; `scatter_dims ⊇ inserted_window` {0,1}⊇{0,1} ✓) → `flattenMultiDimScatterIndices` + matchAndRewrite handle it unchanged.
+
+Implementation locus: `checkBasicLegality` (`:6093`, allow batching dims when de-batchable) + a preprocessing step in `matchAndRewrite` that builds `new_indices` (iota+concat) and the remapped dim numbers before the existing index flattening. Generalize to N batch dims by iota+concat per batch dim. **Verify:** grad bit-exact vs CPU (`repro_scatter_legalize.py` pattern) + a training smoke converges + `qwen_parity.py` byte-identical, before landing.
+
 ## Fix (proposed, not yet landed) — secondary host round-trips
 
 Lower the row-major device-input integer typecast **on-device** instead of via host: `to_layout(tilize) → ttnn.typecast(si32→ui32) → to_layout(untilize)`, all in device memory. Since si32/ui32 are device-tilizable, this is valid and removes the `from_device`, unblocking trace and removing a per-step sync. Locus: the device-input typecast handler in `TTNNDecomposeLayouts.cpp` (the `!output.isTilized()` / row-major typecast branch that currently bounces through host).
