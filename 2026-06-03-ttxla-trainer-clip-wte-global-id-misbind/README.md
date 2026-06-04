@@ -44,8 +44,8 @@ runtime binding — a deep compiler/runtime investigation.
   Logic confirms why: with that guard `getOperandThroughDPSOps` always returns a
   value whose type == `op.getInput()` type, so a call-site net-type-check is a no-op
   too — **the misbind is type-INVISIBLE** (a buffer/global_id aliasing that does not
-  manifest as a type change at the DPS-walk level). qwen_parity stayed byte-identical
-  with the guard deployed (safe defensive no-op, not a regression — kept).
+  manifest as a type change at the DPS-walk level). Qwen2.5-0.5B inference stayed
+  byte-identical with the guard deployed (safe defensive no-op, not a regression — kept).
 - Eliminated by direct experiment (NOT the cause):
   - **global_norm / large reduce-to-scalar** — gating the logging `grad_norm`
     (the trainer's logging grad-norm) did not change it, and a standalone-JAX `global_norm`/`sum`/`sqrt(sum)`
@@ -133,7 +133,7 @@ it (see below). Candidate directions:
   Reason: with the guard, the walk only ever traverses *same-type* steps, so its
   result type always equals `op.getInput()`'s — i.e. the divergence is **not** a
   type change at any DPS step, and a call-site net-type-check is equally a no-op.
-  qwen_parity byte-identical with the guard (safe; kept as defensive no-op).
+  Qwen2.5-0.5B inference byte-identical with the guard (safe; kept as defensive no-op).
 - **Real direction (type-invisible aliasing):** the scalar reshape's recorded
   `TensorRef` ends up being the clip-div output's `global_id` without a type change
   — i.e. two Values genuinely share a buffer/dest at the *runtime* level
