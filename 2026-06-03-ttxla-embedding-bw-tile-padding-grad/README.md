@@ -1,5 +1,13 @@
 # TT Embedding-Backward Corrupts Gradients When vocab/embed-dim Are Not Multiples of the 32 Tile
 
+> **CORRECTION (2026-06-04):** the "blast radius ≈ none / constant-index-only" conclusion below is
+> **wrong**. The root cause was later pinned to integer truncation of `num_embeddings / TILE_HEIGHT`
+> in the program factory, which **drops the last partial vocab tile** → uninitialized DRAM → `inf`
+> (not a finite `+1` leak) with a **real non-uniform cotangent** and **dynamic indices**. Any training
+> with `vocab % 32 != 0` is affected. Fixed with `div_up`. See
+> [2026-06-04-ttmetal-embedding-bw-nonaligned-vocab-droptile-inf](/home/houjun/lessons/2026-06-04-ttmetal-embedding-bw-nonaligned-vocab-droptile-inf/README.md).
+> The all-ones-cotangent characterization below is what masked the inf.
+
 ## Summary
 
 On Tenstorrent Blackhole, the gradient of an embedding lookup (`jnp.take` / gather
