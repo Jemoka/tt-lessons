@@ -2,7 +2,7 @@
 
 ## Summary
 
-Training a Theseus GPT on Blackhole with a **non-tile-aligned vocab** (`V=1000`) produced `inf`
+Training a GPT on Blackhole with a **non-tile-aligned vocab** (`V=1000`) produced `inf`
 for the tied token-embedding (`wte`) gradient on device, while every other parameter was finite and
 matched CPU. The same model with `V=1024` (a multiple of 32) trained cleanly. Isolated to a minimal
 `jax.grad(sum(take(wte, idx) * C))` — embedding-lookup VJP only, no LayerNorm/CE/matmul — the inf
@@ -22,7 +22,7 @@ instead of floor.
   vocab tile when vocab is not a multiple of 32 (`TILE_HEIGHT`).
 - **Component:** tt-metal `embedding_backward_program_factory.cpp` (`num_embeddings_tiles`).
 - **Fixed locally:** **yes** — `div_up` (ceil); `_ttnncpp.so` rebuilt + deployed to
-  `install/lib/_ttnncpp.so` on the run box (tt-qb-ac-02). HW-verified.
+  `install/lib/_ttnncpp.so`. HW-verified.
 - **HW-verified:** **yes.** Post-fix `V=1000` random-cotangent embed-bw grad flips `inf → 2.56e2`
   (==CPU); the full unfrozen GPT demo (`FREEZE_WTE=0`) trains `wte` on-device with falling loss
   (6.97 → 2.08 over 25 steps) and finite gnorm.
@@ -33,7 +33,7 @@ instead of floor.
   real **non-uniform cotangent** (every real training step) the failure is `inf`, and it occurs with
   **dynamic (runtime-arg) indices** too. So **any** training with `vocab % 32 != 0` infs the embedding
   gradient on TT — not a constant-index-only edge case. (Qwen2.5-0.5B vocab `151936 = 32×4748` is
-  aligned, so `qwen_parity` itself is unaffected; this is a general training-correctness bug.)
+  aligned, so Qwen2.5-0.5B inference itself is unaffected; this is a general training-correctness bug.)
 - **Distinct from** the fp32 `generate_zeros_cb` under-zero bug
   ([2026-06-04-ttmetal-embedding-backward-fp32-accumulator-underzero](/home/houjun/lessons/2026-06-04-ttmetal-embedding-backward-fp32-accumulator-underzero/README.md)):
   that zeroes too few bytes *within* a tile (dtype-specific); this drops a whole tile (vocab-alignment-
@@ -41,7 +41,7 @@ instead of floor.
 
 ## Repositories
 
-- **tt-metal** (the fix), inside tt-mlir's third_party on the run box (tt-qb-ac-02):
+- **tt-metal** (the fix), inside tt-mlir's third_party:
   `…/third_party/tt-mlir/src/tt-mlir/third_party/tt-metal/src/tt-metal`, HEAD
   `90c914ef258b5cc92ad172f3604b784ec77253ca`, worktree dirty (this one-line fix + the prior
   `reader_embedding_backward.cpp` fp32 fix).
@@ -50,8 +50,8 @@ instead of floor.
 
 ## Host Environment
 
-- Two boxes, separate `/home` (NOT shared; only `/nfs/tt2` is NFS): build/edit on `tt-qb-ac-01`,
-  chip runs on `tt-qb-ac-02` (`ssh houjun@10.42.100.2`). The fix must be built+deployed on ac-02.
+- Multi-box caveat: if the edit/build box and the chip-run box have **separate (non-shared) `/home`**,
+  the fix must be built and deployed on the box that actually drives the chip (see Notes).
 - Ubuntu 24.04, Linux 6.8.0-110, Python 3.12, Clang 20, jax/jaxlib 0.7.1.
 - Device: Tenstorrent Blackhole p150b. `ARCH_NAME=blackhole`, `JAX_PLATFORMS=tt,cpu`,
   `CONVERT_SHLO_TO_SHARDY=1`, `TT_VISIBLE_DEVICES=1`.
@@ -106,7 +106,7 @@ reader/compute kernel edits. Patch:
 ## Minimal Reproducer
 
 `supplemental/embed_bw_cot2.py` — `jax.grad(sum(take(wte, idx) * C))` with dynamic `idx`, comparing an
-all-ones cotangent vs a random cotangent at `V=1000`. Pure JAX; no Theseus.
+all-ones cotangent vs a random cotangent at `V=1000`. Standalone pure JAX.
 
 1. Builds `wte [V,128]`, dynamic `idx [8,64]`, two cotangents (ones, random).
 2. Computes the embedding-VJP grad norm on CPU and TT.
@@ -114,11 +114,12 @@ all-ones cotangent vs a random cotangent at `V=1000`. Pure JAX; no Theseus.
 
 ## Reproduction Steps
 
+From a venv that has the TT PJRT plugin installed (on the box that drives the chip):
+
 ```bash
-# On the run box (tt-qb-ac-02):
-cd /home/houjun/theseus && source .venv/bin/activate
+source .venv/bin/activate
 TT_VISIBLE_DEVICES=1 JAX_PLATFORMS=tt,cpu ARCH_NAME=blackhole CONVERT_SHLO_TO_SHARDY=1 \
-  python -u /home/houjun/.agents/embed_bw_cot2.py
+  python -u /home/houjun/lessons/2026-06-04-ttmetal-embedding-bw-nonaligned-vocab-droptile-inf/supplemental/embed_bw_cot2.py
 
 # Rebuild after editing the program factory (host code -> _ttnncpp.so):
 cd …/third_party/tt-metal/src/tt-metal/build_Release && ninja _ttnncpp.so
@@ -143,6 +144,7 @@ cp ttnn/_ttnncpp.so ../../../../../install/lib/_ttnncpp.so   # the plugin's RUNP
 - Only the partial-last-tile case is affected; vocab that is already a multiple of 32 (e.g. 1024, or
   Qwen2.5's 151936) was always correct. Embedding dim is separately required to be a multiple of
   `TILE_WIDTH` (asserted in the device op).
-- Two boxes with **separate `/home`**: a fix edited on ac-01 is invisible to ac-02. Apply + rebuild on
-  the box that actually runs the chip (ac-02 here). The plugin loads `_ttnncpp.so` via RUNPATH from
-  `…/install/lib/`, confirmed with `ldd pjrt_plugin_tt.so | grep ttnncpp`.
+- If the edit/build box and the chip-run box have **separate (non-shared) `/home`**, a fix edited on
+  one is invisible to the other — apply + rebuild on the box that actually runs the chip. The plugin
+  loads `_ttnncpp.so` via RUNPATH from `…/install/lib/`, confirmed with
+  `ldd pjrt_plugin_tt.so | grep ttnncpp`.
