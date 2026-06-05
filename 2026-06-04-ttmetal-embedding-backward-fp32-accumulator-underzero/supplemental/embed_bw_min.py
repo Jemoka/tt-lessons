@@ -12,7 +12,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-V, D, B, T = 1000, 128, 8, 64
+V, D, B, T = int(os.environ.get("V_OVERRIDE", "1000")), 128, 8, 64  # V_OVERRIDE=1024 → tile-aligned discriminator
 rng = np.random.default_rng(0)
 wte0 = jnp.asarray(rng.standard_normal((V, D)).astype(np.float32) * 0.02)
 idx0 = jnp.asarray(rng.integers(0, V, size=(B, T)).astype(np.int32))
