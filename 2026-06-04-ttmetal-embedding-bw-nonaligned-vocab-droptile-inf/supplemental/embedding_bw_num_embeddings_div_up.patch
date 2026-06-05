@@ -1,0 +1,22 @@
+diff --git a/ttnn/cpp/ttnn/operations/embedding_backward/device/embedding_backward_program_factory.cpp b/ttnn/cpp/ttnn/operations/embedding_backward/device/embedding_backward_program_factory.cpp
+index 997c93898f..7a6c52c010 100644
+--- a/ttnn/cpp/ttnn/operations/embedding_backward/device/embedding_backward_program_factory.cpp
++++ b/ttnn/cpp/ttnn/operations/embedding_backward/device/embedding_backward_program_factory.cpp
+@@ -62,7 +62,16 @@ EmbeddingBackwardProgramFactory::cached_program_t EmbeddingBackwardProgramFactor
+     uint32_t seq_len_tiles = tensor_args.index_tensor.padded_shape()[-1] / TILE_WIDTH;
+     uint32_t input_height_tiles = batch_size * seq_len_tiles;
+ 
+-    uint32_t num_embeddings_tiles = operation_attributes.num_embeddings / TILE_HEIGHT;
++    // CEIL, not floor: num_embeddings is the LOGICAL vocab (e.g. 1000), but the
++    // output tensor is tile-padded to a multiple of TILE_HEIGHT (1024 = 32 tiles).
++    // Integer-dividing 1000/32 -> 31 leaves the last partial vocab tile (rows
++    // 992-1023, holding VALID logical rows 992-999) outside both the reader's
++    // zero-init loop and the compute accumulation -> that tile keeps uninitialized
++    // DRAM garbage -> inf/NaN gradient rows for any vocab not a multiple of 32.
++    // (Masked by an all-ones cotangent, which happens to stay finite; exposed by a
++    // real non-uniform training cotangent.) div_up covers the partial tile; its
++    // padding rows are never indexed (idx < num_embeddings) so they stay zeroed.
++    uint32_t num_embeddings_tiles = tt::div_up(operation_attributes.num_embeddings, TILE_HEIGHT);
+ 
+     // We split work based on the number of tiles in the embedding dimension
+     auto grid_size = device->compute_with_storage_grid_size();
