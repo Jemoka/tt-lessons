@@ -51,9 +51,15 @@ Same op, three distinct failures (not duplicates):
   — backward (`embedding_bw`): rank-4 runtime output vs rank-2 IR breaks a downstream reduce.
 - [ttmetal-embedding-backward-fp32-accumulator-underzero](2026-06-04-ttmetal-embedding-backward-fp32-accumulator-underzero/README.md)
   — backward (`embedding_bw`): tt-metal kernel under-zeros the fp32 accumulator tile → inf wte grad.
+- [ttmetal-embedding-bw-nonaligned-vocab-droptile-inf](2026-06-04-ttmetal-embedding-bw-nonaligned-vocab-droptile-inf/README.md)
+  — backward (`embedding_bw`): program factory floors `num_embeddings/32`, dropping the last partial
+  vocab tile for `vocab % 32 != 0` → uninitialized DRAM → inf grad. **Fixed** (`div_up`). This is the
+  **corrected root cause** of the `tile-padding-grad` characterization (the all-ones cotangent masked
+  the inf as a finite +1 leak).
 
-Three distinct `embedding_bw` backward bugs above (tile-padding leak, rank mismatch, fp32 zero-fill)
-— same op, different failures, not duplicates.
+Four distinct `embedding_bw` backward bugs above (tile-padding leak — superseded by the droptile root
+cause — rank mismatch, fp32 zero-fill, non-aligned-vocab drop-tile) — same op, different failures,
+not duplicates.
 
 ## Numeric precision (bf16 / TF32 on the FPU and accumulators)
 
