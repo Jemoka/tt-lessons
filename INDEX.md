@@ -49,6 +49,11 @@ Same op, three distinct failures (not duplicates):
   — backward (`embedding_bw`): tile-padding gradient leak.
 - [ttxla-embedding-bw-reduce-rank-mismatch](2026-06-03-ttxla-embedding-bw-reduce-rank-mismatch/README.md)
   — backward (`embedding_bw`): rank-4 runtime output vs rank-2 IR breaks a downstream reduce.
+- [ttmetal-embedding-backward-fp32-accumulator-underzero](2026-06-04-ttmetal-embedding-backward-fp32-accumulator-underzero/README.md)
+  — backward (`embedding_bw`): tt-metal kernel under-zeros the fp32 accumulator tile → inf wte grad.
+
+Three distinct `embedding_bw` backward bugs above (tile-padding leak, rank mismatch, fp32 zero-fill)
+— same op, different failures, not duplicates.
 
 ## Numeric precision (bf16 / TF32 on the FPU and accumulators)
 

@@ -1,6 +1,6 @@
 # tt-metal embedding_backward fp32 accumulator under-zero fix (UNVERIFIED — see notes).
 # File: ttnn/cpp/ttnn/operations/embedding_backward/device/kernels/dataflow/reader_embedding_backward.cpp
-# Root cause (source-confirmed): generate_zeros_cb zeros only 512 words (bf16) or 272 (bfp8_b);
+# Root cause (agent3, source-confirmed): generate_zeros_cb zeros only 512 words (bf16) or 272 (bfp8_b);
 # an fp32 output tile is 1024 words (4096B), so fp32 falls into the bfp8_b branch -> only 1088/4096 B
 # zeroed -> 2944 B garbage per accumulator tile -> accumulate -> inf wte grad.
 # Fix: zero the full tile dtype-agnostically using the real tile size (out_page_size).
@@ -8,7 +8,7 @@
 # REVERTED from the box on 2026-06-04: could NOT verify because the embedding_backward-grad repro
 # HANGS (idle wait) on the box for BOTH this fix AND the original kernel -> the hang is environmental
 # (box TT-runtime degradation after a long session), NOT this patch. Re-apply + verify after a box
-# reboot via supplemental/embed_bw_min.py (expect TT embed_bw_norm: inf -> ~3.12e2).
+# reboot via /home/houjun/.agents/embed_bw_min.py (expect TT embed_bw_norm: inf -> ~3.12e2).
 
 --- generate_zeros_cb: replace the hardcoded 512/272 branches with:
 FORCE_INLINE void generate_zeros_cb(uint32_t input_l1_addr, uint32_t tile_bytes) {

@@ -29,11 +29,6 @@ then accumulated gradients onto. The fix makes the zero-fill dtype-agnostic (zer
 - **Related bug not fixed here:** the tied-weight **matmul-path gradient is dropped** —
   `ttnn::embedding_bw(input, weight, out_grad)` takes `weight` (the scatter operand carrying the
   matmul-VJP grad for a tied weight) but never uses it. That's a correctness bug separate from the inf.
-- **Related (same op, `ttnn.embedding_bw`):** the tile-padding gradient leak
-  ([2026-06-03-ttxla-embedding-bw-tile-padding-grad](/home/houjun/lessons/2026-06-03-ttxla-embedding-bw-tile-padding-grad/README.md))
-  and the rank-4-vs-rank-2 reduce mismatch
-  ([2026-06-03-ttxla-embedding-bw-reduce-rank-mismatch](/home/houjun/lessons/2026-06-03-ttxla-embedding-bw-reduce-rank-mismatch/README.md)).
-  Three distinct `embedding_bw` bugs — not duplicates (kernel zero-fill here vs tile-padding vs runtime rank).
 
 ## Repositories
 
@@ -45,7 +40,7 @@ then accumulated gradients onto. The fix makes the zero-fill dtype-agnostic (zer
 ## Host Environment
 
 - Ubuntu 24.04, Linux 6.8.0-110, Python 3.12, Clang 20. jax/jaxlib 0.7.1.
-- Device: Tenstorrent Blackhole p150b.
+- Device: Tenstorrent Blackhole p150b (`tt-qb2.stanford.edu` / 10.42.100.2).
 - `ARCH_NAME=blackhole`, `JAX_PLATFORMS=tt,cpu`, `CONVERT_SHLO_TO_SHARDY=1`.
 
 ## User-Visible Failure
@@ -124,9 +119,9 @@ norm. Before fix: TT = `inf`. After fix: TT ≈ CPU (`~3.12e2`). Also reproducib
 # tt-metal kernels are JIT-compiled from source, but the binary is CACHED by hash — clear the
 # embedding_backward kernel cache so the edited source recompiles:
 rm -rf ~/.cache/tt-metal-cache/*/kernels/reader_embedding_backward
-source .venv/bin/activate   # a venv with the TT PJRT plugin
+cd /home/houjun/theseus && source .venv/bin/activate
 TT_VISIBLE_DEVICES=1 JAX_PLATFORMS=tt,cpu ARCH_NAME=blackhole CONVERT_SHLO_TO_SHARDY=1 \
-  python /home/houjun/lessons/2026-06-04-ttmetal-embedding-backward-fp32-accumulator-underzero/supplemental/embed_bw_min.py
+  python /home/houjun/.agents/embed_bw_min.py
 ```
 
 ## Verification
