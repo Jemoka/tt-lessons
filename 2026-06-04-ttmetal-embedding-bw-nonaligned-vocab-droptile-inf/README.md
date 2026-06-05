@@ -144,6 +144,13 @@ cp ttnn/_ttnncpp.so ../../../../../install/lib/_ttnncpp.so   # the plugin's RUNP
 - Only the partial-last-tile case is affected; vocab that is already a multiple of 32 (e.g. 1024, or
   Qwen2.5's 151936) was always correct. Embedding dim is separately required to be a multiple of
   `TILE_WIDTH` (asserted in the device op).
+- **Concrete Theseus blast radius:** the mainline GPT configs (`configs/gpt/{small,big,big_36l,
+  a6000_*,a100_*}.yaml`) use `vocab_size: 100288 = 32×3134` — tile-aligned (cl100k's 100277
+  deliberately padded to a 32-multiple) — so `gpt/train/pretrain` was **never** hit by this (it
+  trains `wte` correctly on TT pre-fix, consistent with the "completes end-to-end" result). The
+  affected configs are the dictlearn ones with non-padded vocabs: `dict_v1024.yaml` (1059),
+  `dict_v256.yaml` (291), `dict_v128.yaml` (163), `dict_v32.yaml` (67) — all `%32 = 3` — which
+  would inf on TT with an unfrozen `wte` before this fix.
 - If the edit/build box and the chip-run box have **separate (non-shared) `/home`**, a fix edited on
   one is invisible to the other — apply + rebuild on the box that actually runs the chip. The plugin
   loads `_ttnncpp.so` via RUNPATH from `…/install/lib/`, confirmed with
