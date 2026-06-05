@@ -92,12 +92,18 @@ Three distinct `embedding_bw` backward bugs above (tile-padding leak, rank misma
   — non-row-major host buffers uploaded with the wrong layout (fixed). Its residual
   logit error is the matmul-precision lesson above.
 
-## Suspected duplicates
+## Removed (folded findings / duplicates)
 
 - **Resolved duplicate:** `ttxla-uniform-rand-bf16-getvalues-float` (earlier,
   fix-proposed-only) was folded into the FIXED
   [ttxla-bf16-uniform-init-getvalues-float](2026-06-03-ttxla-bf16-uniform-init-getvalues-float/README.md)
   — same bug, same fix — and removed (original kept in `.orig/`).
+- **Non-bug finding:** `tt-apparent-compile-blowup-is-cold-kernel-jit` (a misdiagnosis
+  postmortem — the apparent compile blowup was benign tt-metal cold-cache kernel JIT, not a
+  source bug) was folded into the
+  [ttmetal-embedding-backward-fp32-accumulator-underzero](2026-06-04-ttmetal-embedding-backward-fp32-accumulator-underzero/README.md)
+  Notes (it resolved that lesson's "downstream blocker") and removed; full original + its
+  diagnostic methodology kept in `.orig/`.
 
 No remaining exact duplicates. The closest related pair is
 **ttxla-embedding-bw-tile-padding-grad** and **ttxla-reshape-tilepadded-dim-flatten**

@@ -23,9 +23,10 @@ then accumulated gradients onto. The fix makes the zero-fill dtype-agnostic (zer
   cache must be cleared so the edited source recompiles — see Reproduction).
 - **Code-reviewed:** yes (independent review confirmed the loop is bounded, the word counts are correct
   fp32→1024 / bf16→512 / bfp8_b→272, and it cannot introduce a hang).
-- **HW-verified to completion:** NO — blocked by a *separate*, downstream issue: with `wte` unfrozen
-  (so `embedding_backward` is actually in the graph), the plugin compile is pathologically slow
-  (>30 min, never finished in test windows). See **Notes**. CPU baseline of the repro is finite.
+- **HW-verified to completion:** NO — the on-device run during testing stalled in tt-metal **cold-cache
+  kernel JIT** (a one-time cost, paid every run only because the kernel cache was cleared to pick up the
+  edited kernel, amplified by box degradation), not a compiler bug. See **Notes**. A warm-cache/healthy
+  box should let it complete. CPU baseline of the repro is finite.
 - **Related bug not fixed here:** the tied-weight **matmul-path gradient is dropped** —
   `ttnn::embedding_bw(input, weight, out_grad)` takes `weight` (the scatter operand carrying the
   matmul-VJP grad for a tied weight) but never uses it. That's a correctness bug separate from the inf.
@@ -131,20 +132,25 @@ TT_VISIBLE_DEVICES=1 JAX_PLATFORMS=tt,cpu ARCH_NAME=blackhole CONVERT_SHLO_TO_SH
 
 ## Verification
 
-CPU baseline finite (`embed_bw_norm=3.12e2`). On-device run-to-completion is **blocked** by a separate
-downstream compile blowup (see Notes), so the fix is **deployed + code-reviewed but not yet HW-confirmed
-end to end**. Expected on a healthy/fast device: TT `embed_bw_norm` flips `inf → ~3.12e2`.
+CPU baseline finite (`embed_bw_norm=3.12e2`). On-device run-to-completion stalled during testing in
+tt-metal cold-cache kernel JIT (a benign one-time cost, not a compiler bug — see Notes), so the fix is
+**deployed + code-reviewed but not yet HW-confirmed end to end**. Expected on a warm-cache/healthy
+device: TT `embed_bw_norm` flips `inf → ~3.12e2`.
 
 ## Notes
 
 - **Why the training demo "worked" with `wte` frozen:** the demo zeroes `wte`'s grad after computing it;
   XLA **DCE then eliminates `embedding_backward` entirely** (its result is unused), so it never runs —
   no `inf`, fast compile. The bug only manifests when `embedding_backward` is actually live.
-- **The downstream blocker:** with `wte` unfrozen, the plugin compile is pathologically slow (>30 min,
-  never completed in test windows; python pinned ~102% CPU). Chip-free `ttmlir-opt` profiling showed the
-  tt-mlir SHLO→TTIR→TTNN lowering is **sub-second** (embedding_backward lowering = 0.057 s), so the
-  blowup is **downstream of MLIR** — TTNN→flatbuffer, tt-metal kernel-JIT, or PJRT/runtime — and needs
-  box-side profiling to pinpoint. This blocks both verifying this fix and training tied embeddings on TT.
+- **The downstream "blocker" was a misdiagnosis — NOT a compiler bug.** With `wte` unfrozen the plugin
+  compile *appeared* pathologically slow (>30 min, python pinned ~102% CPU, device idle). Phase-by-phase
+  timing exonerated the whole compiler (SHLO→TTIR 0.035 s; TTIR→TTNN 2.3 s; TTNN→flatbuffer 0.36 s); the
+  residual silent host-CPU-bound phase is **tt-metal cold-cache kernel JIT** (compiling
+  `embedding_backward`'s `reshuffle_rows_tile` SFPU kernel C++→RISC-V), paid every run only because the
+  kernel cache was being cleared each time to pick up the edited kernel, amplified by box degradation. A
+  warm cache makes it vanish. So this fix is verifiable on a warm-cache/healthy box — the slowness is not
+  a tt-xla/tt-mlir pathology. (Diagnostic methodology for distinguishing MLIR-lowering vs flatbuffer vs
+  program-build vs kernel-JIT hangs is preserved in `.orig/2026-06-04-tt-apparent-compile-blowup-is-cold-kernel-jit/`.)
 - **Diagnosis tooling caveat:** check the *python* pid's CPU, not the bash/timeout wrapper — the wrapper
   is idle while the python compiles at ~102%; this caused a false "hung" read mid-investigation.
 - The `reshuffle_rows_tile(0, idx_addr - 16)` "subtract 16-byte header" hack in the compute kernel was
